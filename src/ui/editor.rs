@@ -342,7 +342,11 @@ impl FileTab {
                         bar.child(
                             icon_button(
                                 "toggle-markdown-preview",
-                                if previewing { Lucide::Code } else { Lucide::Eye },
+                                if previewing {
+                                    Lucide::Code
+                                } else {
+                                    Lucide::Eye
+                                },
                                 cx,
                             )
                             .tooltip(move |window, cx| {

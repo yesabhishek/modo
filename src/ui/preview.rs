@@ -76,7 +76,15 @@ fn parse_block(
         return None;
     }
     let source = SharedString::from(code.value.clone());
-    Some(MarkdownNode::new(BLOCK, Diagram { source: source.clone() }).text(source))
+    Some(
+        MarkdownNode::new(
+            BLOCK,
+            Diagram {
+                source: source.clone(),
+            },
+        )
+        .text(source),
+    )
 }
 
 struct Diagram {
@@ -185,7 +193,12 @@ fn rasterize(source: &str, palette: &Palette) -> Rendered {
     let svg = mermaid::render_with_options(source, options).map_err(|e| e.to_string())?;
     let parse = usvg::Options {
         fontdb: fonts(),
-        font_family: FONT_FAMILY.split(',').next().unwrap_or("Arial").trim().into(),
+        font_family: FONT_FAMILY
+            .split(',')
+            .next()
+            .unwrap_or("Arial")
+            .trim()
+            .into(),
         ..Default::default()
     };
     let tree = usvg::Tree::from_str(&svg, &parse).map_err(|e| e.to_string())?;
