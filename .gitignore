@@ -1,0 +1,6 @@
+/target/
+/dist/
+/THIRD_PARTY_NOTICES.md
+.DS_Store
+*.p12
+*.pfx

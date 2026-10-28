@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible problem in Modo.
+title: "Bug: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Modo version or commit
+      description: Include the release version or the commit used for a source build.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS on Apple Silicon
+        - macOS on Intel
+        - Windows x64
+        - Linux source build
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system version
+      placeholder: macOS 15.6, Windows 11, Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Share the shortest sequence that shows the problem. Remove private file contents and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include relevant logs or a screenshot when useful.
+    validations:
+      required: true

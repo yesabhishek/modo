@@ -1,0 +1,78 @@
+[package]
+name = "modo"
+version = "0.2.0"
+edition = "2024"
+description = "A calm, fast, native workspace for reading, reviewing, and editing code an agent wrote."
+repository = "https://github.com/yesabhishek/modo"
+homepage = "https://github.com/yesabhishek/modo"
+readme = "README.md"
+keywords = ["editor", "code-review", "terminal", "native", "desktop"]
+categories = ["text-editors", "development-tools"]
+publish = false
+license = "MIT"
+default-run = "modo"
+
+[features]
+default = []
+# Offscreen frame capture for visual review (`modo --capture out.png`).
+# Pulls in GPUI's test support, so release builds leave it off.
+capture = ["gpui-kit/test-support"]
+
+[dependencies]
+gpui-kit = { version = "=0.8.1", features = [
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-kotlin",
+    "tree-sitter-lua",
+    "tree-sitter-make",
+    "tree-sitter-markdown",
+    "tree-sitter-php",
+    "tree-sitter-python",
+    "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-sql",
+    "tree-sitter-swift",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+    "tree-sitter-zig",
+] }
+alacritty_terminal = "0.25.1"
+anyhow = "1"
+blake3 = "1.8"
+directories = "6.0"
+futures = "0.3"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+nucleo-matcher = "0.3"
+open = "5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+# Keep debug builds responsive: optimize dependencies, not our crate.
+[profile.dev.package."*"]
+opt-level = 2

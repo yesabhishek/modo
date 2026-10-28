@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Modo
+GenericName=Code Review Editor
+Comment=Read, review, and edit what your agents wrote
+Exec=modo %F
+Icon=dev.modo.Modo
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=inode/directory;text/plain;
+StartupWMClass=dev.modo.Modo
+Keywords=code;editor;review;git;diff;terminal;

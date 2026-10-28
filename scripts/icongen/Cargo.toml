@@ -1,0 +1,13 @@
+# Renders assets/brand/app-icon.svg into the platform icon files.
+# Run via scripts/make-icons.sh; not part of the app build.
+[package]
+name = "icongen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+resvg = "0.46"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }

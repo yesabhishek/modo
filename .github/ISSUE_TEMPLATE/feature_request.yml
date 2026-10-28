@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused improvement to Modo.
+title: "Feature: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: Describe what you are trying to do and where Modo gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Explain the smallest change that would help, including alternatives you considered.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Examples, sketches, or related issues are welcome.
