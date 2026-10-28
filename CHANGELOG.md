@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0 (2026-10-28)
+## 0.2.1 (2026-10-28)
 
-Modo is a ground-up rebuild of the earlier Aardvark IDX / Kite prototype.
+First public release. Modo is a ground-up rebuild of the earlier Aardvark IDX / Kite prototype.
 
 - **New name and identity.** Modo, with a monochrome "M with a check" icon and Notion-inspired Light, Dark, Paper, and Graphite themes.
 - **GPU rendering.** Rebuilt on GPUI and GPUI Kit (Metal on macOS, DirectX on Windows, Vulkan on Linux) for smooth scrolling and native text rendering.

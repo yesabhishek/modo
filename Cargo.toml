@@ -1,6 +1,6 @@
 [package]
 name = "modo"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A calm, fast, native workspace for reading, reviewing, and editing code an agent wrote."
 repository = "https://github.com/yesabhishek/modo"
