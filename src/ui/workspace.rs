@@ -57,6 +57,7 @@ actions!(
         CopyPath,
         CopyRelativePath,
         ToggleSoftWrap,
+        ToggleMarkdownPreview,
         ToggleReviewLayout,
         ZoomIn,
         ZoomOut,
@@ -101,6 +102,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(k("cmd-shift-g"), ReviewChanges, Some(CONTEXT)),
         KeyBinding::new(k("cmd-shift-e"), ShowFiles, Some(CONTEXT)),
         KeyBinding::new("alt-z", ToggleSoftWrap, Some(CONTEXT)),
+        KeyBinding::new(k("cmd-shift-v"), ToggleMarkdownPreview, Some(CONTEXT)),
         KeyBinding::new(k("cmd-="), ZoomIn, None),
         KeyBinding::new(k("cmd-+"), ZoomIn, None),
         KeyBinding::new(k("cmd--"), ZoomOut, None),
@@ -1673,6 +1675,14 @@ impl Render for Workspace {
                     let path = files::display_relative(root, &file.path);
                     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path));
                     this.status = Some("Copied relative path".into());
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMarkdownPreview, window, cx| {
+                if let Some(ix) = this.active
+                    && let Some(Tab::File(file)) = this.tabs.get_mut(ix)
+                {
+                    file.toggle_preview(window, cx);
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|_, _: &ToggleSoftWrap, _, cx| {

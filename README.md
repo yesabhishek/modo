@@ -75,6 +75,7 @@ Then review what your agent did:
 | Command palette | `⌘K` | `Ctrl+K` |
 | Search in files | `⌘⇧F` | `Ctrl+Shift+F` |
 | Review changes | `⌘⇧G` | `Ctrl+Shift+G` |
+| Markdown preview | `⌘⇧V` | `Ctrl+Shift+V` |
 | Terminal | `⌘J` | `Ctrl+J` |
 | Settings | `⌘,` | `Ctrl+,` |
 

@@ -163,6 +163,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Sidebar", ws::ToggleSidebar),
                 MenuItem::action("Toggle Terminal", ws::ToggleTerminal),
                 MenuItem::action("Toggle Word Wrap", ws::ToggleSoftWrap),
+                MenuItem::action("Toggle Markdown Preview", ws::ToggleMarkdownPreview),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ws::ZoomIn),
                 MenuItem::action("Zoom Out", ws::ZoomOut),

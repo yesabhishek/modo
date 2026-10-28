@@ -2,6 +2,7 @@
 //! converted to rems, so the interface zoom setting scales everything.
 pub mod editor;
 pub mod palette;
+pub mod preview;
 pub mod review;
 pub mod settings_view;
 pub mod sidebar;

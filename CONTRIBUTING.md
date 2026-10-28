@@ -24,7 +24,7 @@ For visible changes, attach before and after screenshots. You can render them wi
 cargo run --features capture -- --capture shot.png --scene review path/to/repo
 ```
 
-Scenes: `editor`, `review`, `review-split`, `palette`, `commands`, `search`, `settings`, `live`, and `tour` (writes a folder of frames for the README GIF). `MODO_CAPTURE_THEME=light|dark|paper|graphite` picks a theme.
+Scenes: `editor`, `preview` (markdown, via `MODO_CAPTURE_FILE`), `review`, `review-split`, `palette`, `commands`, `search`, `settings`, `live`, and `tour` (writes a folder of frames for the README GIF). `MODO_CAPTURE_THEME=light|dark|paper|graphite` picks a theme.
 
 ## Style
 

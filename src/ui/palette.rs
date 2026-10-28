@@ -178,6 +178,13 @@ fn commands() -> Vec<Command> {
             Lucide::TextWrap,
         ),
         c(
+            "Toggle markdown preview",
+            Box::new(ws::ToggleMarkdownPreview),
+            "⇧⌘V",
+            "Ctrl+Shift+V",
+            Lucide::Eye,
+        ),
+        c(
             "Toggle split / unified review",
             Box::new(ws::ToggleReviewLayout),
             "",

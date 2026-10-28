@@ -1,9 +1,11 @@
 //! An open file: its editor state, save bookkeeping, and the page around it.
 use std::path::{Path, PathBuf};
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, StyledExt as _, h_flex,
     input::{Editor, EditorState, InputEvent, Position, TabSize},
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{
@@ -12,8 +14,8 @@ use gpui_kit::{
 };
 
 use super::{
-    r,
-    workspace::{Tab, Workspace},
+    icon_button, preview, r,
+    workspace::{Tab, ToggleMarkdownPreview, Workspace},
 };
 use crate::{
     document::{self, LineEnding, LoadedFile},
@@ -37,6 +39,10 @@ pub struct FileTab {
     saving: Option<u64>,
     /// The file changed on disk while it had unsaved edits.
     pub disk_changed: bool,
+    /// Show the rendered markdown instead of the source.
+    pub preview: bool,
+    /// The text last handed to the preview, and the edit version it came from.
+    preview_text: Option<(u64, SharedString)>,
     applied: Option<Settings>,
     _subscription: Subscription,
 }
@@ -128,8 +134,38 @@ impl FileTab {
             version: 0,
             saving: None,
             disk_changed: false,
+            preview: false,
+            preview_text: None,
             applied: Some(settings),
             _subscription: subscription,
+        }
+    }
+
+    pub fn is_markdown(&self) -> bool {
+        preview::is_markdown(self.language)
+    }
+
+    /// Flip between the markdown source and its rendered preview.
+    pub fn toggle_preview(&mut self, window: &mut Window, cx: &mut App) {
+        if !self.is_markdown() {
+            return;
+        }
+        self.preview = !self.preview;
+        if self.preview {
+            preview::warm_up();
+        } else {
+            self.focus(window, cx);
+        }
+    }
+
+    fn preview_source(&mut self, cx: &App) -> SharedString {
+        match &self.preview_text {
+            Some((version, text)) if *version == self.version => text.clone(),
+            _ => {
+                let text = self.editor.read(cx).value();
+                self.preview_text = Some((self.version, text.clone()));
+                text
+            }
         }
     }
 
@@ -234,6 +270,7 @@ impl FileTab {
             state.set_value(file.text, window, cx);
             state.set_cursor_position(position, window, cx);
         });
+        self.preview_text = None;
         self.dirty = false;
         self.disk_changed = false;
     }
@@ -286,6 +323,10 @@ impl FileTab {
             sep.into_iter().chain(std::iter::once(label))
         });
         let path = self.path.clone();
+        let is_markdown = self.is_markdown();
+        let previewing = self.preview && is_markdown;
+        let preview_source = previewing.then(|| self.preview_source(cx));
+        let scroll_id = SharedString::from(format!("preview:{}", self.path.display()));
         v_flex()
             .size_full()
             .child(
@@ -296,7 +337,27 @@ impl FileTab {
                     .gap(r(6.))
                     .text_size(r(12.5))
                     .text_color(theme.muted_foreground)
-                    .children(crumbs),
+                    .child(h_flex().flex_1().min_w_0().gap(r(6.)).children(crumbs))
+                    .when(is_markdown, |bar| {
+                        bar.child(
+                            icon_button(
+                                "toggle-markdown-preview",
+                                if previewing { Lucide::Code } else { Lucide::Eye },
+                                cx,
+                            )
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(if previewing {
+                                    "Edit source (⇧⌘V)"
+                                } else {
+                                    "Preview markdown (⇧⌘V)"
+                                })
+                                .build(window, cx)
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleMarkdownPreview), cx);
+                            }),
+                        )
+                    }),
             )
             .when(self.disk_changed, |page| {
                 page.child(
@@ -341,15 +402,26 @@ impl FileTab {
                         ),
                 )
             })
-            .child(
-                div().flex_1().min_h_0().child(
-                    Editor::new(&self.editor)
-                        .bordered(false)
-                        .appearance(false)
-                        .size_full()
-                        .xsmall(),
-                ),
-            )
+            .child(match preview_source {
+                Some(text) => div()
+                    .id(scroll_id.clone())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(preview::body(scroll_id, text, cx))
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Editor::new(&self.editor)
+                            .bordered(false)
+                            .appearance(false)
+                            .size_full()
+                            .xsmall(),
+                    )
+                    .into_any_element(),
+            })
     }
 }
 

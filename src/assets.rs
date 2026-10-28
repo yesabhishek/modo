@@ -14,6 +14,7 @@ icon_assets!(
         Command,
         CornerDownLeft,
         Diff,
+        Eye,
         File,
         FileCode,
         FileDiff,

@@ -14,7 +14,7 @@ use gpui_kit::{
 
 use crate::{
     settings::{ReviewLayout, Settings, ThemeChoice},
-    ui::workspace::{Panel, Workspace},
+    ui::workspace::{Panel, Tab, Workspace},
 };
 
 type Action = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
@@ -41,12 +41,13 @@ fn theme_from_env() -> Option<ThemeChoice> {
 }
 
 fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
+    let want_preview = scene == "preview";
     let scene = scene.to_owned();
     let settle = std::env::var("MODO_CAPTURE_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1600);
-    vec![
+    let mut steps = vec![
         Step::Wait(900),
         act(move |ws, window, cx| {
             if let Some(file) = file {
@@ -78,7 +79,22 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
         }),
         Step::Wait(settle),
         Step::Shot(0),
-    ]
+    ];
+    if want_preview {
+        // The file loads in the background; switch once its tab exists.
+        steps.insert(
+            2,
+            act(|ws, window, cx| {
+                if let Some(ix) = ws.active
+                    && let Some(Tab::File(file)) = ws.tabs.get_mut(ix)
+                {
+                    file.toggle_preview(window, cx);
+                }
+            }),
+        );
+        steps.insert(2, Step::Wait(800));
+    }
+    steps
 }
 
 /// A walkthrough of the review loop: find a file, review the branch, switch
