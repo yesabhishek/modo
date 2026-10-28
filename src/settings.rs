@@ -68,7 +68,9 @@ pub struct Settings {
     pub tab_size: u8,
     pub format_on_save_trim: bool,
     pub terminal_font_size: f32,
-    /// Empty means the user's login shell.
+    /// The profile new terminals start with. Empty means the platform default.
+    pub terminal_profile: String,
+    /// The command the Custom profile runs.
     pub terminal_shell: String,
     pub review_layout: ReviewLayout,
     pub review_base: ReviewBase,
@@ -90,6 +92,7 @@ impl Default for Settings {
             tab_size: 4,
             format_on_save_trim: false,
             terminal_font_size: 12.5,
+            terminal_profile: String::new(),
             terminal_shell: String::new(),
             review_layout: ReviewLayout::Unified,
             review_base: ReviewBase::Branch,
@@ -143,6 +146,8 @@ pub struct ProjectSession {
     pub expanded: Vec<PathBuf>,
     pub sidebar_width: f32,
     pub terminal_open: bool,
+    /// The branch the user chose to review against, when not the detected one.
+    pub review_base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

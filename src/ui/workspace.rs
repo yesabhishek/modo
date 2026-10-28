@@ -252,6 +252,7 @@ pub struct Workspace {
     pub index: Option<Arc<FileIndex>>,
     pub indexing: Option<Task<()>>,
     pub review: Entity<Review>,
+    pub changes_scroll: UniformListScrollHandle,
     pub search: Entity<super::sidebar::SearchPanel>,
     pub terminal: Entity<TerminalPanel>,
     pub palette: Option<Entity<Palette>>,
@@ -333,6 +334,7 @@ impl Workspace {
             index: None,
             indexing: None,
             review,
+            changes_scroll: UniformListScrollHandle::new(),
             search,
             terminal,
             palette: None,
@@ -357,7 +359,7 @@ impl Workspace {
 
     /// Open a folder as the project, or a file inside its parent folder.
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         if path.is_file() {
             let root = git_root_or_parent(&path);
             if self.project.as_ref().map(|p| &p.root) != Some(&root) {
@@ -410,8 +412,10 @@ impl Workspace {
         for dir in expanded {
             self.load_dir(dir, cx);
         }
-        self.review
-            .update(cx, |review, cx| review.set_root(Some(root.clone()), cx));
+        let review_base = restored.as_ref().and_then(|s| s.review_base.clone());
+        self.review.update(cx, |review, cx| {
+            review.set_root(Some(root.clone()), review_base, cx)
+        });
         self.search
             .update(cx, |search, cx| search.set_root(Some(root.clone()), cx));
         self.terminal
@@ -464,6 +468,7 @@ impl Workspace {
                 .collect(),
             sidebar_width: self.sidebar_width,
             terminal_open: self.terminal.read(cx).open,
+            review_base: self.review.read(cx).chosen_base(),
         };
         Session::remember(cx, session);
     }
@@ -853,7 +858,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         if let Some(ix) = self.tab_for_path(&path) {
             self.activate(ix, window, cx);
             if let (Some(line), Some(Tab::File(file))) = (line, self.tabs.get(ix)) {
@@ -1230,6 +1235,7 @@ impl Workspace {
             super::review::ReviewEvent::OpenFile(path, line) => {
                 self.open_file(path.clone(), *line, window, cx)
             }
+            super::review::ReviewEvent::BaseChanged => self.remember_session(cx),
         }
     }
 

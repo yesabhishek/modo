@@ -1,11 +1,6 @@
 //! The integrated terminal: a native PTY driven by alacritty_terminal, painted
 //! directly on the GPU one styled run at a time.
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
 
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize},
@@ -19,19 +14,28 @@ use alacritty_terminal::{
     vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb},
 };
 use futures::{StreamExt, channel::mpsc};
-use gpui_kit::component::{ActiveTheme, IconName, StyledExt as _, Theme, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, IconName, Sizable, StyledExt as _, Theme,
+    button::{Button, ButtonVariants},
+    h_flex,
+    menu::{DropdownMenu, PopupMenuItem},
+    v_flex,
+};
 use gpui_kit::{
-    App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Element, ElementId, Empty,
-    Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
+    Anchor, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Element, ElementId,
+    Empty, Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels,
     Point, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Style,
-    Styled, Task, TextAlign, TextRun, Window, actions, div, fill, outline, point,
+    Styled, Task, TextAlign, TextRun, WeakEntity, Window, actions, div, fill, outline, point,
     prelude::FluentBuilder, px, relative, size,
 };
 
 use super::{icon_button, is_mac, r};
-use crate::settings::Settings;
+use crate::{
+    settings::Settings,
+    shells::{self, Profile},
+};
 
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 
@@ -40,10 +44,17 @@ const SCROLLBACK: usize = 10_000;
 
 pub fn init(cx: &mut App) {
     let mut bindings = vec![
-        // Keys the shell needs more than the workspace does.
+        // Keys the shell needs more than the workspace does. The window root
+        // binds Tab to focus cycling, which would swallow completion.
+        KeyBinding::new("tab", NoAction, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(CONTEXT)),
         KeyBinding::new("ctrl-g", NoAction, Some(CONTEXT)),
         KeyBinding::new("escape", NoAction, Some(CONTEXT)),
     ];
+    if cfg!(windows) {
+        // Like Windows Terminal: Ctrl+V pastes. Ctrl+C is handled on key down.
+        bindings.push(KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)));
+    }
     if is_mac() {
         bindings.extend([
             KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
@@ -58,6 +69,8 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("ctrl-shift-k", Clear, Some(CONTEXT)),
         ]);
         for key in [
+            // The root binds Ctrl+C to copy; here it interrupts unless text is selected.
+            "ctrl-c",
             "ctrl-p",
             "ctrl-k",
             "ctrl-b",
@@ -140,10 +153,20 @@ impl TerminalPanel {
     }
 
     pub fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_with(None, window, cx);
+    }
+
+    /// Open a terminal running `profile`, or the default profile from Settings.
+    pub fn new_session_with(
+        &mut self,
+        profile: Option<Profile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         let cwd = self.cwd.clone();
-        let view = cx.new(|cx| TerminalView::new(id, cwd, window, cx));
+        let view = cx.new(|cx| TerminalView::new(id, cwd, profile, window, cx));
         cx.observe(&view, |this, view, cx| {
             if view.read(cx).exited {
                 this.remove(&view, cx);
@@ -230,7 +253,7 @@ impl Render for TerminalPanel {
                         .invisible()
                         .group_hover("term-tab", |s| s.visible())
                         .hover(move |s| s.bg(hover))
-                        .child(gpui_kit::component::Icon::new(IconName::Close).size(r(11.)))
+                        .child(Icon::new(IconName::Close).size(r(11.)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.active = ix;
@@ -294,10 +317,15 @@ impl Render for TerminalPanel {
                     .child(
                         icon_button("term-new", IconName::Plus, cx)
                             .size(r(22.))
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new("New terminal")
+                                    .build(window, cx)
+                            })
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.new_session(window, cx)),
                             ),
                     )
+                    .child(profile_menu(cx.entity().downgrade(), cx))
                     .child(div().flex_1())
                     .child(
                         icon_button("term-hide", IconName::ChevronDown, cx)
@@ -317,6 +345,41 @@ impl Render for TerminalPanel {
                     }),
             )
     }
+}
+
+/// The caret beside "+": every installed shell, so any of them is one click away.
+fn profile_menu(panel: WeakEntity<TerminalPanel>, cx: &App) -> impl IntoElement {
+    Button::new("term-profiles")
+        .ghost()
+        .xsmall()
+        .icon(Icon::new(IconName::ChevronDown).size(r(13.)))
+        .text_color(cx.theme().muted_foreground)
+        .tab_stop(false)
+        .tooltip("Open a terminal with…")
+        // The panel sits at the bottom of the window, so the menu opens upward.
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
+            let settings = Settings::get(cx);
+            let default = shells::resolve(&settings.terminal_profile, &settings.terminal_shell);
+            let mut menu = menu.min_w(px(200.)).label("New terminal");
+            for profile in shells::available(&settings.terminal_shell) {
+                let panel = panel.clone();
+                let is_default = default.as_ref().is_some_and(|d| d.name == profile.name);
+                let label = if is_default {
+                    format!("{} (default)", profile.name)
+                } else {
+                    profile.name.clone()
+                };
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let profile = profile.clone();
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.new_session_with(Some(profile), window, cx)
+                        })
+                        .ok();
+                }));
+            }
+            menu
+        })
 }
 
 // ---- Session ----------------------------------------------------------------
@@ -386,28 +449,18 @@ struct Spawn {
     listener: Listener,
 }
 
-/// The user's shell as a login shell, started directly rather than through
-/// `/usr/bin/login`, which would print a "Last login" banner on macOS.
-fn shell_command(configured: &str) -> Option<(String, Vec<String>)> {
-    if !configured.is_empty() {
-        let mut parts = configured.split_whitespace().map(str::to_owned);
-        let program = parts.next()?;
-        return Some((program, parts.collect()));
-    }
-    if cfg!(windows) {
-        return None;
-    }
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.trim().is_empty() && Path::new(s).exists())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh".into()
-            } else {
-                "/bin/bash".into()
-            }
-        });
-    Some((shell, vec!["-l".to_owned()]))
+/// The program to start, run directly rather than through `/usr/bin/login`,
+/// which would print a "Last login" banner on macOS.
+fn tty_shell(profile: &Profile) -> tty::Shell {
+    // On Windows the program goes into a command line unescaped, so a path
+    // with spaces (C:\Program Files\...) must arrive quoted.
+    let program =
+        if cfg!(windows) && profile.program.contains(' ') && !profile.program.starts_with('"') {
+            format!("\"{}\"", profile.program)
+        } else {
+            profile.program.clone()
+        };
+    tty::Shell::new(program, profile.args.clone())
 }
 
 /// Shell prompts often title the terminal `user@host:~/path`; that is noise in a tab.
@@ -424,7 +477,13 @@ fn clean_title(title: &str, program: &str) -> SharedString {
 }
 
 impl TerminalView {
-    fn new(id: u64, cwd: Option<PathBuf>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        id: u64,
+        cwd: Option<PathBuf>,
+        profile: Option<Profile>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let size = GridSize {
             columns: 100,
             lines: 24,
@@ -432,25 +491,23 @@ impl TerminalView {
             line_height: px(17.),
         };
         let (tx, mut rx) = mpsc::unbounded();
-        let configured = Settings::get(cx).terminal_shell.trim().to_owned();
-        let shell = shell_command(&configured);
-        let program = shell
-            .as_ref()
-            .map(|(program, _)| {
-                program
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("shell")
-                    .to_owned()
-            })
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "PowerShell".into()
-                } else {
-                    "shell".into()
-                }
-            });
-        let shell = shell.map(|(program, args)| tty::Shell::new(program, args));
+        let profile = profile.or_else(|| {
+            let settings = Settings::get(cx);
+            shells::resolve(&settings.terminal_profile, &settings.terminal_shell)
+        });
+        let program = match &profile {
+            // A custom command is better named by what it runs.
+            Some(p) if p.name == shells::CUSTOM => p
+                .program
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("shell")
+                .trim_end_matches(".exe")
+                .to_owned(),
+            Some(p) => p.name.clone(),
+            None => "PowerShell".into(),
+        };
+        let shell = profile.as_ref().map(tty_shell);
         let mut env = HashMap::new();
         env.insert("TERM".to_owned(), "xterm-256color".to_owned());
         env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
@@ -461,7 +518,11 @@ impl TerminalView {
         );
         let options = tty::Options {
             shell,
-            working_directory: cwd.filter(|p| p.is_dir()),
+            // `\\?\C:\...` paths make PowerShell treat local scripts as remote
+            // and break path completion.
+            working_directory: cwd
+                .filter(|p| p.is_dir())
+                .map(|p| dunce::simplified(&p).to_path_buf()),
             drain_on_exit: true,
             env,
             #[cfg(target_os = "windows")]
@@ -612,6 +673,12 @@ impl TerminalView {
         }
     }
 
+    fn has_selection(&self) -> bool {
+        self.term
+            .as_ref()
+            .is_some_and(|t| t.lock().selection.as_ref().is_some_and(|s| !s.is_empty()))
+    }
+
     fn mode(&self) -> TermMode {
         self.term
             .as_ref()
@@ -619,7 +686,26 @@ impl TerminalView {
             .unwrap_or(TermMode::NONE)
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let m = &keystroke.modifiers;
+        // Off macOS, Ctrl+C copies a selection like Windows Terminal; with
+        // nothing selected it interrupts as usual.
+        if !is_mac()
+            && keystroke.key == "c"
+            && m.control
+            && !m.shift
+            && !m.alt
+            && self.has_selection()
+        {
+            self.copy(&Copy, window, cx);
+            if let Some(term) = &self.term {
+                term.lock().selection = None;
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let mode = self.mode();
         if let Some(bytes) = encode_key(&event.keystroke, mode) {
             self.input(bytes);
@@ -841,6 +927,8 @@ struct TerminalElement {
 struct Run {
     line: usize,
     column: usize,
+    /// Grid cells covered, kept so extending a run never recounts its text.
+    cells: usize,
     text: String,
     color: Hsla,
     bold: bool,
@@ -985,7 +1073,7 @@ impl Element for TerminalElement {
                 let wide = flags.contains(Flags::WIDE_CHAR);
                 let extends = runs.last().is_some_and(|last: &Run| {
                     last.line == line
-                        && last.column + last.text.chars().count() == column
+                        && last.column + last.cells == column
                         && last.color == fg
                         && last.bold == bold
                         && last.italic == italic
@@ -994,11 +1082,14 @@ impl Element for TerminalElement {
                         && !last.text.ends_with('\u{0}')
                 });
                 if extends && !wide {
-                    runs.last_mut().unwrap().text.push(cell.c);
+                    let last = runs.last_mut().unwrap();
+                    last.text.push(cell.c);
+                    last.cells += 1;
                 } else {
                     runs.push(Run {
                         line,
                         column,
+                        cells: if wide { 2 } else { 1 },
                         text: cell.c.to_string(),
                         color: fg,
                         bold,
@@ -1011,6 +1102,7 @@ impl Element for TerminalElement {
                         runs.push(Run {
                             line,
                             column: column + 2,
+                            cells: 0,
                             text: String::new(),
                             color: fg,
                             bold,
@@ -1425,16 +1517,6 @@ mod tests {
         assert_eq!(clean_title("cargo test", "zsh"), "cargo test");
         assert_eq!(clean_title("", "zsh"), "zsh");
         assert_eq!(clean_title("vim notes: draft", "zsh"), "vim notes: draft");
-    }
-
-    #[test]
-    fn configured_shells_keep_their_arguments_and_defaults_are_login_shells() {
-        let (program, args) = shell_command("/bin/bash --noprofile").unwrap();
-        assert_eq!(program, "/bin/bash");
-        assert_eq!(args, ["--noprofile"]);
-        if !cfg!(windows) {
-            assert!(shell_command("").is_some());
-        }
     }
 
     #[test]

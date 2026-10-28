@@ -198,7 +198,7 @@ pub fn inspect(folder: &Path) -> Result<Option<Repository>, String> {
         return Err(top.error);
     }
     let root = path_from_bytes(top.bytes.strip_suffix(b"\n").unwrap_or(&top.bytes));
-    let root = root.canonicalize().unwrap_or(root);
+    let root = dunce::canonicalize(&root).unwrap_or(root);
     let branch = run(&root, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let branch = if branch.success {
         String::from_utf8_lossy(&branch.bytes).trim().to_owned()
@@ -277,7 +277,7 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
         if let Some(path) = field.strip_prefix(b"worktree ") {
             let path = path_from_bytes(path);
             result.push(Worktree {
-                path: path.canonicalize().unwrap_or(path),
+                path: dunce::canonicalize(&path).unwrap_or(path),
                 branch: "Detached".into(),
             });
         } else if let Some(branch) = field.strip_prefix(b"branch refs/heads/")
@@ -341,6 +341,36 @@ pub fn default_base(root: &Path) -> Option<String> {
         })
 }
 
+/// Local and remote branches to compare against, most recently committed first.
+pub fn branches(root: &Path) -> Vec<String> {
+    let Ok(out) = run(
+        root,
+        [
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--count=200",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    if !out.success {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.bytes)
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("refs/heads/")
+                .or_else(|| line.strip_prefix("refs/remotes/"))
+        })
+        // `origin/HEAD` only points at another remote branch.
+        .filter(|name| !name.is_empty() && !name.ends_with("/HEAD"))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn resolve(root: &Path, rev: &str) -> Option<String> {
     let out = run(
         root,
@@ -394,9 +424,8 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
     let mut included = 0;
     for raw in untracked.bytes.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let relative = path_from_bytes(raw);
-        let size = std::fs::symlink_metadata(root.join(&relative))
-            .map(|m| m.len())
-            .unwrap_or(u64::MAX);
+        let metadata = std::fs::symlink_metadata(root.join(&relative));
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(u64::MAX);
         if size > MAX_UNTRACKED_FILE
             || included >= MAX_UNTRACKED_FILES
             || patch.len() as u64 > MAX_PATCH
@@ -404,24 +433,107 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
             skipped += 1;
             continue;
         }
-        // `--no-index` exits 1 when the files differ, which is the point here.
-        let added = run(
-            root,
-            [
-                OsStr::new("diff"),
-                OsStr::new("--no-ext-diff"),
-                OsStr::new("--no-index"),
-                OsStr::new("--"),
-                OsStr::new("/dev/null"),
-                relative.as_os_str(),
-            ],
-        )?;
-        if !added.bytes.is_empty() {
-            patch.push_str(&String::from_utf8_lossy(&added.bytes));
-            included += 1;
-        }
+        let Ok(metadata) = metadata else { continue };
+        // Built here rather than with `git diff --no-index` per file: hundreds
+        // of Git processes take seconds on Windows.
+        let (mode, content) = if metadata.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(root.join(&relative)) else {
+                continue;
+            };
+            ("120000", target.to_string_lossy().into_owned().into_bytes())
+        } else {
+            let Ok(content) = std::fs::read(root.join(&relative)) else {
+                continue;
+            };
+            let mode = if is_executable(&metadata) {
+                "100755"
+            } else {
+                "100644"
+            };
+            (mode, content)
+        };
+        added_file_patch(&mut patch, &String::from_utf8_lossy(raw), mode, &content);
+        included += 1;
     }
     Ok(ReviewPatch { patch, skipped })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Append the patch Git prints for a new file: every line added, or a binary marker.
+fn added_file_patch(patch: &mut String, path: &str, mode: &str, content: &[u8]) {
+    use std::fmt::Write as _;
+    let old = quote_path("a/", path);
+    let new = quote_path("b/", path);
+    let _ = write!(patch, "diff --git {old} {new}\nnew file mode {mode}\n");
+    if content.is_empty() {
+        return;
+    }
+    // Git's own test: a NUL byte near the start means binary.
+    if content[..content.len().min(8000)].contains(&0) {
+        let _ = writeln!(patch, "Binary files /dev/null and {new} differ");
+        return;
+    }
+    let text = String::from_utf8_lossy(content);
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    let lines = body.split('\n').count();
+    let range = if lines == 1 {
+        "1".to_owned()
+    } else {
+        format!("1,{lines}")
+    };
+    // Git ends a header path containing a space with a tab, for patch(1).
+    let tab = if new.contains(' ') { "\t" } else { "" };
+    let _ = write!(
+        patch,
+        "--- /dev/null\n+++ {new}{tab}\n@@ -0,0 +{range} @@\n"
+    );
+    for line in body.split('\n') {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    if !text.ends_with('\n') {
+        patch.push_str("\\ No newline at end of file\n");
+    }
+}
+
+/// Quote a path the way Git does in patch headers when it holds special characters.
+fn quote_path(prefix: &str, path: &str) -> String {
+    let needs_quotes = path
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control());
+    if !needs_quotes {
+        return format!("{prefix}{path}");
+    }
+    let mut quoted = format!("\"{prefix}");
+    for c in path.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            c if c.is_control() => {
+                let mut buf = [0; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]
@@ -500,6 +612,27 @@ mod tests {
         assert!(!uncommitted.patch.contains("fn agent"));
     }
     #[test]
+    fn any_branch_can_be_the_review_base() {
+        let dir = repository();
+        git(dir.path(), &["switch", "-c", "dev"]);
+        std::fs::write(dir.path().join("dev.txt"), "dev\n").unwrap();
+        commit(dir.path(), "Dev work");
+        git(dir.path(), &["switch", "-c", "agent/feature"]);
+        std::fs::write(dir.path().join("agent.txt"), "agent\n").unwrap();
+        commit(dir.path(), "Agent work");
+        let branches = branches(dir.path());
+        assert_eq!(branches.len(), 3);
+        assert!(branches.iter().any(|b| b == "dev"));
+        assert!(branches.iter().any(|b| b == "agent/feature"));
+        let since_dev = review_patch(dir.path(), ReviewScope::Branch("dev".into())).unwrap();
+        assert!(since_dev.patch.contains("+agent"));
+        assert!(!since_dev.patch.contains("+dev"));
+        let since_main = review_patch(dir.path(), ReviewScope::Branch("main".into())).unwrap();
+        assert!(since_main.patch.contains("+dev"));
+        let missing = review_patch(dir.path(), ReviewScope::Branch("gone".into()));
+        assert_eq!(missing.unwrap_err(), "Cannot find branch gone.");
+    }
+    #[test]
     fn renames_deletions_and_existing_worktrees_are_discovered() {
         let dir = repository();
         git(dir.path(), &["mv", "file.txt", "renamed.txt"]);
@@ -517,7 +650,7 @@ mod tests {
         assert!(
             repo.worktrees
                 .iter()
-                .any(|w| w.branch == "review" && w.path == tree.canonicalize().unwrap())
+                .any(|w| w.branch == "review" && w.path == dunce::canonicalize(&tree).unwrap())
         );
         std::fs::remove_file(dir.path().join("renamed.txt")).unwrap();
         let repo = inspect(dir.path()).unwrap().unwrap();
@@ -528,6 +661,52 @@ mod tests {
                 .patch
                 .contains("deleted file")
         );
+    }
+    #[test]
+    fn untracked_files_patch_exactly_like_git_diff_no_index() {
+        let dir = repository();
+        let cases: &[(&str, &[u8])] = &[
+            ("lines.txt", b"one\ntwo\n"),
+            ("single.txt", b"only\n"),
+            ("no-newline.txt", b"first\nlast"),
+            ("crlf.txt", b"a\r\nb\r\n"),
+            ("blank-lines.txt", b"\n\nx\n"),
+            ("binary.bin", &[0, 1, 2, 3]),
+            ("empty.txt", b""),
+            ("dir/with space.md", b"# title\n"),
+        ];
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        for (path, content) in cases {
+            std::fs::write(dir.path().join(path), content).unwrap();
+        }
+        for (path, content) in cases {
+            let git = run(
+                dir.path(),
+                [
+                    "-c",
+                    "core.autocrlf=false",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    path,
+                ],
+            )
+            .unwrap();
+            // Git adds blob ids, which the review never reads.
+            let expected: String = String::from_utf8_lossy(&git.bytes)
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("index "))
+                .collect();
+            let mut ours = String::new();
+            added_file_patch(&mut ours, path, "100644", content);
+            assert_eq!(ours, expected, "{path}");
+        }
+        let review = review_patch(dir.path(), ReviewScope::Uncommitted).unwrap();
+        let files = gpui_kit::component::diff::DiffFile::parse(&review.patch).unwrap();
+        assert_eq!(files.len(), cases.len());
+        assert_eq!(quote_path("a/", "say \"hi\".txt"), r#""a/say \"hi\".txt""#);
     }
     #[test]
     fn unborn_repositories_review_against_the_empty_tree() {

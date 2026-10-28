@@ -1,6 +1,7 @@
 ; Modo installer: per-user, no admin rights needed.
 ; Built by scripts/package-windows.ps1, which defines VERSION, NUMERIC_VERSION,
-; STAGING (folder with modo.exe, modo.ico, LICENSE), and OUTFILE.
+; STAGING (folder with modo.exe, conpty.dll, OpenConsole.exe, modo.ico, LICENSE),
+; and OUTFILE.
 Unicode true
 !include "MUI2.nsh"
 !include "x64.nsh"
@@ -40,6 +41,9 @@ FunctionEnd
 Section "Install"
   SetOutPath "$INSTDIR"
   File "${STAGING}\modo.exe"
+  ; Windows Terminal's ConPTY, which the integrated terminal prefers.
+  File "${STAGING}\conpty.dll"
+  File "${STAGING}\OpenConsole.exe"
   File "${STAGING}\modo.ico"
   File "${STAGING}\LICENSE"
   File /nonfatal "${STAGING}\THIRD_PARTY_NOTICES.md"
@@ -69,6 +73,8 @@ SectionEnd
 Section "Uninstall"
   SetRegView 64
   Delete "$INSTDIR\modo.exe"
+  Delete "$INSTDIR\conpty.dll"
+  Delete "$INSTDIR\OpenConsole.exe"
   Delete "$INSTDIR\modo.ico"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"

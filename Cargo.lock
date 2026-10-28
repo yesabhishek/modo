@@ -4251,12 +4251,13 @@ dependencies = [
 
 [[package]]
 name = "modo"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "blake3",
  "directories",
+ "dunce",
  "futures",
  "gpui-kit",
  "grep-matcher",

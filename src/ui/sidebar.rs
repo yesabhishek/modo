@@ -458,7 +458,7 @@ fn render_changes(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
     let theme = cx.theme().clone();
     let review = this.review.read(cx);
     let summary = review.summary(cx);
-    let files = review.files().to_vec();
+    let count = review.files().len();
     let worktrees = this
         .git
         .repo
@@ -531,7 +531,7 @@ fn render_changes(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
                 .child(div().truncate().child(branch)),
         );
     }
-    col = col.child(super::review::scope_switcher(&this.review, cx));
+    col = col.child(super::review::compare_picker(&this.review, cx));
     col = col.child(
         h_flex()
             .px(r(14.))
@@ -555,85 +555,108 @@ fn render_changes(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
                 )
             }),
     );
-    let list = v_flex()
-        .id("changes-list")
-        .flex_1()
-        .overflow_y_scroll()
-        .pb(r(12.))
-        .children(files.into_iter().enumerate().map(|(ix, file)| {
-            let hover = theme.list_hover;
-            let path = file.path.clone();
-            let name = Path::new(path.as_ref())
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let dir = Path::new(path.as_ref())
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let color = status_color(file.badge, cx);
+    // Branch reviews can touch thousands of files; draw only the visible rows.
+    let list = uniform_list(
+        "changes-list",
+        count,
+        cx.processor(|this: &mut Workspace, range: Range<usize>, _, cx| {
+            let files = this.review.read(cx).files();
+            range
+                .filter_map(|ix| files.get(ix).cloned().map(|file| (ix, file)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(ix, file)| render_change_row(ix, file, cx))
+                .collect::<Vec<_>>()
+        }),
+    )
+    .track_scroll(&this.changes_scroll)
+    .flex_1()
+    .pb(r(12.));
+    col.child(list).into_any_element()
+}
+
+fn render_change_row(
+    ix: usize,
+    file: super::review::ReviewFile,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    let hover = theme.list_hover;
+    let path = file.path.clone();
+    let name = Path::new(path.as_ref())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = Path::new(path.as_ref())
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let color = status_color(file.badge, cx);
+    let count = |text: String, color: Hsla| {
+        div()
+            .flex_none()
+            .text_size(r(11.5))
+            .text_color(color)
+            .child(text)
+    };
+    let row = h_flex()
+        .id(("change", ix))
+        .w_full()
+        .h(r(27.))
+        .px(r(8.))
+        .gap(r(6.))
+        .rounded(r(5.))
+        .text_size(r(13.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(file_icon(Path::new(path.as_ref()), cx).flex_none())
+        .child(
+            // The folder only takes space the name leaves; a long name truncates
+            // before it can run into the counts.
             h_flex()
-                .id(("change", ix))
-                .h(r(27.))
-                .mx(r(6.))
-                .px(r(8.))
+                .flex_1()
+                .min_w_0()
                 .gap(r(6.))
-                .rounded(r(5.))
-                .text_size(r(13.))
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .child(file_icon(Path::new(path.as_ref()), cx))
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(r(6.))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(theme.sidebar_foreground)
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(r(12.))
-                                .text_color(theme.muted_foreground)
-                                .child(dir),
-                        ),
-                )
-                .when(file.additions > 0, |r| {
-                    r.child(
-                        div()
-                            .text_size(super::r(11.5))
-                            .text_color(theme.green)
-                            .child(format!("+{}", file.additions)),
-                    )
-                })
-                .when(file.deletions > 0, |r| {
-                    r.child(
-                        div()
-                            .text_size(super::r(11.5))
-                            .text_color(theme.red)
-                            .child(format!("−{}", file.deletions)),
-                    )
-                })
+                .overflow_hidden()
                 .child(
                     div()
-                        .w(r(10.))
-                        .text_size(super::r(11.5))
-                        .font_medium()
-                        .text_color(color)
-                        .child(file.badge),
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.sidebar_foreground)
+                        .child(name),
                 )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_review(window, cx);
-                    let path = path.clone();
-                    this.review
-                        .update(cx, |review, cx| review.scroll_to_file(&path, cx));
-                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(r(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(dir),
+                ),
+        )
+        .when(file.additions > 0, |r| {
+            r.child(count(format!("+{}", file.additions), theme.green))
+        })
+        .when(file.deletions > 0, |r| {
+            r.child(count(format!("−{}", file.deletions), theme.red))
+        })
+        .child(
+            div()
+                .flex_none()
+                .w(r(10.))
+                .text_size(r(11.5))
+                .font_medium()
+                .text_color(color)
+                .child(file.badge),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_review(window, cx);
+            let path = path.clone();
+            this.review
+                .update(cx, |review, cx| review.scroll_to_file(&path, cx));
         }));
-    col.child(list).into_any_element()
+    div().w_full().px(r(6.)).child(row).into_any_element()
 }
 
 /// Return the sidebar to the file tree.

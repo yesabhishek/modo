@@ -11,6 +11,7 @@ mod files;
 mod git;
 mod search;
 mod settings;
+mod shells;
 mod theme;
 mod ui;
 
@@ -74,7 +75,7 @@ fn parse_args() -> Option<Args> {
             _ => path = Some(PathBuf::from(arg)),
         }
     }
-    let path = path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let path = path.map(|p| dunce::canonicalize(&p).unwrap_or(p));
     Some(Args {
         path,
         capture: capture.map(|c| (c, scene)),
@@ -205,7 +206,7 @@ fn path_from_url(url: &str) -> Option<PathBuf> {
 
 /// Bring an existing window for `path` forward, or open a new one.
 fn open_or_focus(path: PathBuf, cx: &mut App) {
-    let path = path.canonicalize().unwrap_or(path);
+    let path = dunce::canonicalize(&path).unwrap_or(path);
     for window in cx.windows() {
         let found = window
             .update(cx, |root, window, cx| {

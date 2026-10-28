@@ -33,9 +33,8 @@ pub struct LoadedFile {
 }
 
 pub fn load(path: &Path) -> Result<LoadedFile, String> {
-    let path = path
-        .canonicalize()
-        .map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+    let path =
+        dunce::canonicalize(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
     let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
     if !metadata.is_file() {
         return Err("Choose a regular text file.".into());

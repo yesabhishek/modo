@@ -4,19 +4,21 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt as _,
+    ActiveTheme, Icon, IconName, Sizable,
+    button::{Button, ButtonVariants},
     diff::{
         Diff, DiffChangeIndicator, DiffFile, DiffFileStatus, DiffHoverHighlight, DiffHunkSeparator,
         DiffMode, DiffSide, DiffState,
     },
     h_flex,
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     spinner::Spinner,
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 
 use super::{icon_button, r};
@@ -28,6 +30,8 @@ use crate::{
 
 pub enum ReviewEvent {
     OpenFile(PathBuf, Option<u32>),
+    /// The user picked what to compare against; worth remembering per project.
+    BaseChanged,
 }
 
 #[derive(Clone)]
@@ -48,7 +52,12 @@ pub struct Summary {
 pub struct Review {
     root: Option<PathBuf>,
     repo: Option<git::Repository>,
+    /// The branch this one most likely forked from.
     base: Option<String>,
+    /// A base the user picked for this project, overriding `base`.
+    chosen: Option<String>,
+    /// Branches offered as bases, most recent first.
+    branches: Vec<String>,
     scope: ReviewBase,
     state: Entity<DiffState>,
     files: Vec<ReviewFile>,
@@ -60,6 +69,7 @@ pub struct Review {
     focus: FocusHandle,
     _task: Option<Task<()>>,
     reload_task: Option<Task<()>>,
+    branch_task: Option<Task<()>>,
     /// Frames left to redraw after new files arrive: the diff list measures its
     /// viewport while drawing, so its width settles on the following frame.
     settle_frames: u8,
@@ -75,6 +85,8 @@ impl Review {
             root: None,
             repo: None,
             base: None,
+            chosen: None,
+            branches: Vec::new(),
             scope: settings.review_base,
             state,
             files: Vec::new(),
@@ -86,6 +98,7 @@ impl Review {
             focus: cx.focus_handle(),
             _task: None,
             reload_task: None,
+            branch_task: None,
             settle_frames: 0,
         }
     }
@@ -98,10 +111,18 @@ impl Review {
         &self.files
     }
 
-    pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+    /// Show `root`, comparing against `chosen` when the user picked a base before.
+    pub fn set_root(
+        &mut self,
+        root: Option<PathBuf>,
+        chosen: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.root = root;
         self.repo = None;
         self.base = None;
+        self.chosen = chosen;
+        self.branches.clear();
         self.files.clear();
         self.loaded = false;
         self.error = None;
@@ -113,6 +134,7 @@ impl Review {
         let first = self.repo.is_none();
         self.repo = repo;
         if first && let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) {
+            self.load_branches(cx);
             // Finding the base is a couple of Git calls; keep it off the UI thread.
             self._task = Some(cx.spawn(async move |this, cx| {
                 let base = cx
@@ -153,14 +175,45 @@ impl Review {
         }));
     }
 
+    /// Refresh the branches the compare menu offers.
+    pub fn load_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) else {
+            return;
+        };
+        self.branch_task = Some(cx.spawn(async move |this, cx| {
+            let branches = cx
+                .background_executor()
+                .spawn(async move { git::branches(&root) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.branches = branches;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn chosen_base(&self) -> Option<String> {
+        self.chosen.clone()
+    }
+
     fn effective_scope(&self) -> ReviewScope {
-        match (&self.scope, &self.base, self.repo.as_ref()) {
-            (ReviewBase::Branch, Some(base), Some(repo))
-                if repo.branch != *base && !base.ends_with(&format!("/{}", repo.branch)) =>
-            {
-                ReviewScope::Branch(base.clone())
-            }
-            _ => ReviewScope::Uncommitted,
+        let Some(repo) = self.repo.as_ref() else {
+            return ReviewScope::Uncommitted;
+        };
+        if self.scope == ReviewBase::Uncommitted {
+            return ReviewScope::Uncommitted;
+        }
+        // A base the user picked is used as is; the detected one is skipped on
+        // the branch it names (main against origin/main shows nothing useful).
+        let chosen = self.chosen.as_ref().filter(|b| **b != repo.branch);
+        let detected = self
+            .base
+            .as_ref()
+            .filter(|b| **b != repo.branch && !b.ends_with(&format!("/{}", repo.branch)));
+        match chosen.or(detected) {
+            Some(base) => ReviewScope::Branch(base.clone()),
+            None => ReviewScope::Uncommitted,
         }
     }
 
@@ -237,12 +290,22 @@ impl Review {
         }));
     }
 
-    pub fn set_scope(&mut self, scope: ReviewBase, cx: &mut Context<Self>) {
-        if self.scope != scope {
-            self.scope = scope;
-            Settings::update(cx, |s| s.review_base = scope);
-            self.reload(cx);
+    /// Compare against uncommitted work (`None`) or everything since `branch`.
+    pub fn choose(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        let scope = if branch.is_some() {
+            ReviewBase::Branch
+        } else {
+            ReviewBase::Uncommitted
+        };
+        let chosen = branch.or_else(|| self.chosen.clone());
+        if self.scope == scope && self.chosen == chosen {
+            return;
         }
+        self.scope = scope;
+        self.chosen = chosen;
+        Settings::update(cx, |s| s.review_base = scope);
+        cx.emit(ReviewEvent::BaseChanged);
+        self.reload(cx);
     }
 
     pub fn apply_settings(&mut self, settings: &Settings, cx: &mut Context<Self>) {
@@ -294,16 +357,10 @@ impl Review {
         }
     }
 
-    fn scope_title(&self) -> SharedString {
+    /// What the review shows, for the compare menu's button.
+    fn compare_label(&self) -> SharedString {
         match self.effective_scope() {
-            ReviewScope::Branch(base) => {
-                let branch = self
-                    .repo
-                    .as_ref()
-                    .map(|r| r.branch.clone())
-                    .unwrap_or_default();
-                format!("{branch} since {base}").into()
-            }
+            ReviewScope::Branch(base) => format!("Since {base}").into(),
             ReviewScope::Uncommitted => "Uncommitted changes".into(),
         }
     }
@@ -316,60 +373,108 @@ fn mode(layout: ReviewLayout) -> DiffMode {
     }
 }
 
-/// Two small pills that choose between branch and uncommitted review.
-pub fn scope_switcher<T: 'static>(
-    review: &Entity<Review>,
-    cx: &mut Context<T>,
-) -> impl IntoElement {
+/// The compare menu: uncommitted work, or everything since any local or
+/// remote branch, the likely base first and the rest by recent commits.
+fn compare_menu(
+    review: WeakEntity<Review>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, cx| {
+        let Some(entity) = review.upgrade() else {
+            return menu;
+        };
+        let this = entity.read(cx);
+        let current = this.effective_scope();
+        let branch = this.repo.as_ref().map(|r| r.branch.clone());
+        let mut bases: Vec<String> = Vec::new();
+        for base in this
+            .base
+            .iter()
+            .chain(this.chosen.iter())
+            .chain(this.branches.iter())
+        {
+            if Some(base) != branch.as_ref() && !bases.contains(base) {
+                bases.push(base.clone());
+            }
+        }
+        let detected = this.base.clone();
+        let pick = |choice: Option<String>| {
+            let review = review.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                if let Some(review) = review.upgrade() {
+                    review.update(cx, |review, cx| review.choose(choice.clone(), cx));
+                }
+            }
+        };
+        let mut menu = menu.min_w(px(240.)).max_h(px(420.)).scrollable(true).item(
+            PopupMenuItem::new("Uncommitted changes")
+                .checked(current == ReviewScope::Uncommitted)
+                .on_click(pick(None)),
+        );
+        if !bases.is_empty() {
+            menu = menu.separator().label("Everything since");
+        }
+        for base in bases {
+            let label = if Some(&base) == detected.as_ref() {
+                format!("{base}  (default)")
+            } else {
+                base.clone()
+            };
+            let checked = current == ReviewScope::Branch(base.clone());
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .checked(checked)
+                    .on_click(pick(Some(base))),
+            );
+        }
+        menu
+    }
+}
+
+/// A full-width row in the Changes panel that opens the compare menu.
+pub fn compare_picker(review: &Entity<Review>, cx: &App) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let current = review.read(cx).scope;
-    let base = review.read(cx).base.clone();
-    let pill = |id: &'static str, label: SharedString, value: ReviewBase| {
-        let selected = current == value;
-        let review = review.clone();
-        let hover = theme.list_hover;
-        div()
-            .id(id)
-            .flex_1()
-            .h(r(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(r(5.))
-            .text_size(r(12.))
-            .cursor_pointer()
-            .when(selected, |d| {
-                d.bg(theme.background)
-                    .text_color(theme.foreground)
-                    .font_medium()
-                    .shadow_xs()
-            })
-            .when(!selected, |d| {
-                d.text_color(theme.muted_foreground)
-                    .hover(move |s| s.bg(hover))
-            })
-            .child(label)
-            .on_click(move |_, _, cx| review.update(cx, |review, cx| review.set_scope(value, cx)))
-    };
-    h_flex()
-        .mx(r(14.))
-        .mt(r(4.))
-        .p(r(2.))
-        .gap(r(2.))
-        .rounded(r(7.))
-        .bg(theme.list_hover)
-        .child(pill(
-            "scope-branch",
-            base.map(|b| format!("Since {b}"))
-                .unwrap_or_else(|| "Branch".into())
-                .into(),
-            ReviewBase::Branch,
-        ))
-        .child(pill(
-            "scope-uncommitted",
-            "Uncommitted".into(),
-            ReviewBase::Uncommitted,
-        ))
+    let label = review.read(cx).compare_label();
+    let weak = review.downgrade();
+    div().px(r(6.)).pt(r(2.)).child(
+        Button::new("compare-picker")
+            .ghost()
+            .small()
+            .w_full()
+            .h(r(28.))
+            .px(r(8.))
+            .rounded(px(6.))
+            .tab_stop(false)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(r(8.))
+                    .text_size(r(13.))
+                    .child(
+                        Icon::new(Lucide::GitCompare)
+                            .size(r(15.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.sidebar_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(r(14.))
+                            .text_color(theme.muted_foreground),
+                    ),
+            )
+            .dropdown_menu(compare_menu(weak.clone()))
+            .on_open_change(move |open, _, cx| {
+                if *open && let Some(review) = weak.upgrade() {
+                    review.update(cx, |review, cx| review.load_branches(cx));
+                }
+            }),
+    )
 }
 
 impl Focusable for Review {
@@ -387,6 +492,13 @@ impl Render for Review {
         let theme = cx.theme().clone();
         let summary = self.summary(cx);
         let layout = Settings::get(cx).review_layout;
+        let branch_name: SharedString = self
+            .repo
+            .as_ref()
+            .map(|r| r.branch.clone())
+            .unwrap_or_else(|| "Review".into())
+            .into();
+        let weak = cx.entity().downgrade();
         let segment = |id: &'static str, icon: Lucide, value: ReviewLayout, tip: &'static str| {
             let selected = layout == value;
             let hover = theme.list_hover;
@@ -423,11 +535,34 @@ impl Render for Review {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
-                            .text_size(r(16.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .child(self.scope_title()),
+                        h_flex()
+                            .min_w_0()
+                            .gap(r(4.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(r(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(branch_name),
+                            )
+                            .child(
+                                Button::new("review-compare")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(self.compare_label())
+                                    .dropdown_caret(true)
+                                    .text_color(theme.muted_foreground)
+                                    .text_size(r(13.))
+                                    .tab_stop(false)
+                                    .dropdown_menu(compare_menu(weak.clone()))
+                                    .on_open_change(move |open, _, cx| {
+                                        if *open && let Some(review) = weak.upgrade() {
+                                            review
+                                                .update(cx, |review, cx| review.load_branches(cx));
+                                        }
+                                    }),
+                            ),
                     )
                     .child(
                         h_flex()

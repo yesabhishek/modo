@@ -14,11 +14,11 @@ Agents like Claude Code, Codex, and Cursor write most of the code now. What you 
 
 ## What it does
 
-- **Review agent work.** One scrollable diff of everything a branch changed since `main`, or only what is uncommitted. Unified or side by side, syntax highlighted, word-level changes marked. Switch between git worktrees in one click.
+- **Review agent work.** One scrollable diff of everything a branch changed since `main` (or any branch you pick), or only what is uncommitted. Unified or side by side, syntax highlighted, word-level changes marked. Switch between git worktrees in one click.
 - **Read and edit code.** Tree-sitter highlighting for over 25 languages, find and replace, multiple cursors, safe saves that never overwrite changes made on disk.
 - **Follow along live.** Files, the tree, and the review refresh on their own while an agent edits.
 - **Find anything.** Fuzzy file search, project-wide search on ripgrep's engine, and a command palette.
-- **Run commands.** A real terminal with tabs, true color, and your login shell.
+- **Run commands.** A real terminal with tabs, true color, and the shell you choose: zsh, bash, fish, PowerShell, Command Prompt, Git Bash, WSL, or your own command.
 - **Look calm.** Light, Dark, Paper, and Graphite themes, inspired by Notion.
 
 ## Install
@@ -65,7 +65,7 @@ modo .
 
 Then review what your agent did:
 
-1. Press `⌘⇧G` (Ctrl+Shift+G) to open **Review**. It compares the branch with `main` by default; choose **Uncommitted** in the sidebar to see only local edits.
+1. Press `⌘⇧G` (Ctrl+Shift+G) to open **Review**. It compares the branch with `main` by default; use the menu beside the branch name to compare with any other branch, or choose **Uncommitted changes** to see only local edits.
 2. Click a file in the sidebar to jump to it. Double-click a line, or use **Open file**, to edit it.
 3. Press `⌘J` (Ctrl+J) for a terminal to run tests or commit.
 

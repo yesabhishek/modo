@@ -8,7 +8,8 @@ use std::{path::PathBuf, time::Duration};
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, AsyncApp, Bounds, Context, TitlebarOptions, Window,
+    AnyWindowHandle, App, AppContext, AsyncApp, Bounds, Context, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, TitlebarOptions, Window,
     WindowBounds, WindowOptions, point, px, size,
 };
 
@@ -21,6 +22,8 @@ type Action = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace
 
 enum Step {
     Do(Action),
+    /// Click at a point in window coordinates, as the pointer would.
+    Click(f32, f32),
     Wait(u64),
     /// Save a frame that the animation holds for this many milliseconds.
     Shot(u64),
@@ -28,6 +31,40 @@ enum Step {
 
 fn act(f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static) -> Step {
     Step::Do(Box::new(f))
+}
+
+fn click(window: &mut Window, x: f32, y: f32, cx: &mut App) {
+    let position = point(px(x), px(y));
+    let modifiers = Modifiers::default();
+    // Move first so hover and hit testing see the pointer where it presses.
+    window.dispatch_event(
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers,
+        }),
+        cx,
+    );
+    window.draw(cx).clear(cx);
+    window.dispatch_event(
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        }),
+        cx,
+    );
+    window.dispatch_event(
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers,
+            click_count: 1,
+        }),
+        cx,
+    );
 }
 
 fn theme_from_env() -> Option<ThemeChoice> {
@@ -64,6 +101,12 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
                 "palette" => ws.open_palette("", window, cx),
                 "commands" => ws.open_palette(">", window, cx),
                 "settings" => ws.open_settings(window, cx),
+                "settings-terminal" => {
+                    ws.open_settings(window, cx);
+                    if let Some(view) = ws.settings.clone() {
+                        view.update(cx, |view, cx| view.show_terminal(cx));
+                    }
+                }
                 "search" => {
                     ws.panel = Panel::Search;
                     let query =
@@ -78,8 +121,15 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
             }
         }),
         Step::Wait(settle),
-        Step::Shot(0),
     ];
+    // `MODO_CAPTURE_CLICK=x,y` clicks a control, such as a menu, before the shot.
+    if let Some((x, y)) = std::env::var("MODO_CAPTURE_CLICK").ok().and_then(|at| {
+        let (x, y) = at.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    }) {
+        steps.extend([Step::Click(x, y), Step::Wait(600)]);
+    }
+    steps.push(Step::Shot(0));
     if want_preview {
         // The file loads in the background; switch once its tab exists.
         steps.insert(
@@ -277,6 +327,10 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
                     cx.background_executor()
                         .timer(Duration::from_millis(ms))
                         .await
+                }
+                Step::Click(x, y) => {
+                    let _ = handle.update(cx, |_, window, cx| click(window, x, y, cx));
+                    let _ = handle.update(cx, |_, window, cx| window.draw(cx).clear(cx));
                 }
                 Step::Do(f) => {
                     let _ = handle.update(cx, |_, window, cx| {

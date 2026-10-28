@@ -2,21 +2,26 @@
 //! labelled rows with a control on the right.
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt as _, h_flex,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt as _,
+    button::Button,
+    h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
+    Anchor, AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    prelude::FluentBuilder, px,
 };
 
 use super::{r, shortcut};
 use crate::{
     brand,
     settings::{ReviewBase, ReviewLayout, Settings, ThemeChoice},
+    shells,
 };
 
 pub struct Close;
@@ -83,7 +88,11 @@ impl SettingsView {
         });
         let shell_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Login shell (default)")
+                .placeholder(if cfg!(windows) {
+                    r#""C:\Tools\nu.exe" --login"#
+                } else {
+                    "/opt/homebrew/bin/fish -l"
+                })
                 .default_value(settings.terminal_shell.clone())
         });
         let subscriptions = vec![
@@ -103,7 +112,17 @@ impl SettingsView {
                 |_, input, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                         let value = input.read(cx).value().trim().to_owned();
-                        Settings::update(cx, |s| s.terminal_shell = value);
+                        Settings::update(cx, |s| {
+                            // Typing a command means "use it"; clearing it goes back to a shell.
+                            if value.is_empty() {
+                                if s.terminal_profile == shells::CUSTOM {
+                                    s.terminal_profile.clear();
+                                }
+                            } else if value != s.terminal_shell {
+                                s.terminal_profile = shells::CUSTOM.to_owned();
+                            }
+                            s.terminal_shell = value;
+                        });
                     }
                 },
             ),
@@ -119,6 +138,12 @@ impl SettingsView {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.focus.focus(window, cx);
+    }
+
+    #[cfg(feature = "capture")]
+    pub fn show_terminal(&mut self, cx: &mut Context<Self>) {
+        self.category = Category::Terminal;
+        cx.notify();
     }
 
     fn render_category(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -222,8 +247,14 @@ impl SettingsView {
             Category::Terminal => vec![
                 heading("Terminal", cx),
                 row(
-                    "Shell",
-                    "Program to run. Leave empty for your login shell.",
+                    "Default profile",
+                    "The shell new terminals open with. The menu beside + opens any other.",
+                    profile_picker(&s, cx),
+                    cx,
+                ),
+                row(
+                    "Custom command",
+                    "Adds a Custom profile. Quote paths that contain spaces.",
                     div()
                         .w(r(220.))
                         .child(Input::new(&self.shell_input).small())
@@ -339,6 +370,7 @@ fn row(
     cx: &App,
 ) -> AnyElement {
     h_flex()
+        .w_full()
         .py(r(10.))
         .gap(r(24.))
         .child(
@@ -452,6 +484,54 @@ fn segmented<T: Copy + PartialEq + 'static>(
                 .child(*label)
                 .on_click(move |_, _, cx| Settings::update(cx, |s| set(s, value)))
         }))
+        .into_any_element()
+}
+
+/// A menu of the shells found on this machine, plus the custom command.
+fn profile_picker(settings: &Settings, cx: &App) -> AnyElement {
+    let current = shells::resolve(&settings.terminal_profile, &settings.terminal_shell)
+        .map(|p| p.name)
+        .unwrap_or_else(|| "PowerShell".into());
+    Button::new("terminal-profile")
+        .outline()
+        .small()
+        .min_w(r(160.))
+        .label(current.clone())
+        .dropdown_caret(true)
+        .text_color(cx.theme().foreground)
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, cx| {
+            let custom = Settings::get(cx).terminal_shell.clone();
+            let mut menu = menu.min_w(px(200.));
+            for profile in shells::available(&custom) {
+                let name = profile.name.clone();
+                let detail = if name == shells::CUSTOM {
+                    custom.clone()
+                } else {
+                    profile.program.clone()
+                };
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        v_flex()
+                            .py(r(1.))
+                            .child(div().text_size(r(13.)).child(name.clone()))
+                            .child(
+                                div()
+                                    .max_w(r(320.))
+                                    .truncate()
+                                    .text_size(r(11.5))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(detail.clone()),
+                            )
+                    })
+                    .checked(profile.name == current)
+                    .on_click(move |_, _, cx| {
+                        let name = profile.name.clone();
+                        Settings::update(cx, |s| s.terminal_profile = name);
+                    }),
+                );
+            }
+            menu
+        })
         .into_any_element()
 }
 
