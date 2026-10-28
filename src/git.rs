@@ -1,6 +1,6 @@
 //! Read-only repository queries. Git runs off the UI thread with bounded output.
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -181,7 +181,7 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
     }
     #[cfg(not(unix))]
     {

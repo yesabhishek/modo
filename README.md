@@ -28,8 +28,9 @@ Download a build from the [Releases page](https://github.com/yesabhishek/modo/re
 | Platform | File | Notes |
 | --- | --- | --- |
 | macOS 12+ | `modo-<version>-macos-universal.dmg` | Drag Modo to Applications. See the first-launch note below. |
-| Windows 10+ | `modo-<version>-windows-x64-setup.exe` | Installs for your user only. Adds "Open with Modo" to folders. |
-| Linux | `modo-<version>-linux-x86_64.tar.gz` | Extract, then put `modo` on your PATH. Runs on X11 and Wayland. |
+| Windows 10+ | `modo-<version>-windows-x64-setup.exe` | Installs for your user only. Adds "Open with Modo" to folders. If SmartScreen appears, choose More info > Run anyway. |
+| Ubuntu / Debian | `modo_<version>_amd64.deb` | `sudo apt install ./modo_<version>_amd64.deb` |
+| Other Linux | `modo-<version>-linux-x86_64.tar.gz` | Extract, then put `modo` on your PATH. Runs on X11 and Wayland. |
 
 **First launch on macOS.** Modo is not notarized by Apple, so macOS blocks the first launch. Open it once, then go to System Settings > Privacy & Security and click **Open Anyway**. Or run this once:
 

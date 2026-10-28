@@ -2,7 +2,7 @@
 
 1. Update `version` in `Cargo.toml` and the top entry of `CHANGELOG.md`.
 2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
-3. The Release workflow builds every platform and opens a draft GitHub release with the installers and checksums. Review it and publish.
+3. The Release workflow builds every platform and publishes a GitHub release with the installers, checksums, and install notes.
 
 ## Build installers locally
 
@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | macOS | `scripts/package-macos.sh` (add `--universal` for Intel + Apple silicon) | `.dmg`, `.zip`, `Modo.app` |
 | Windows | `pwsh scripts/package-windows.ps1` (needs NSIS) | `-setup.exe`, `.zip` |
-| Linux | `scripts/package-linux.sh` | `.tar.gz` |
+| Linux (Debian-based) | `scripts/package-linux.sh` | `.deb`, `.tar.gz` |
 
 Each script also writes `THIRD_PARTY_NOTICES.md` (all dependency licenses) into the package.
 

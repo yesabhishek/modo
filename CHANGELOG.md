@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-28)
 
 Modo is a ground-up rebuild of the earlier Aardvark IDX / Kite prototype.
 
@@ -11,4 +11,4 @@ Modo is a ground-up rebuild of the earlier Aardvark IDX / Kite prototype.
 - **Editor.** Tree-sitter highlighting for over 25 languages, folding, multiple cursors, find and replace, conflict-safe saves.
 - **Search.** Fuzzy go-to-file, project search on ripgrep's engine, and a command palette with `>`, `:`, and `@` modes.
 - **Terminal.** Native PTY with tabs, true color, and the user's login shell.
-- **Install.** macOS DMG with a `modo` command, Windows installer with "Open with Modo", Linux tarball and desktop entry.
+- **Install.** macOS DMG with a `modo` command, Windows installer with "Open with Modo", and a Linux `.deb` plus tarball with a desktop entry.

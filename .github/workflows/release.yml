@@ -1,6 +1,6 @@
 name: Release
-# Push a tag like v0.2.0 to build installers for every platform and attach
-# them to a draft GitHub release.
+# Push a tag like v0.2.0 to build installers for every platform and publish
+# them as a GitHub release anyone can download.
 on:
   push:
     tags: ['v*']
@@ -18,7 +18,8 @@ jobs:
         include:
           - { name: macOS, os: macos-15 }
           - { name: Windows, os: windows-2025 }
-          - { name: Linux, os: ubuntu-24.04 }
+          # The oldest supported Ubuntu, so the .deb runs on older distributions too.
+          - { name: Linux, os: ubuntu-22.04 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -56,6 +57,7 @@ jobs:
             dist/*.zip
             dist/*.exe
             dist/*.tar.gz
+            dist/*.deb
             dist/*SHA256SUMS.txt
           if-no-files-found: error
 
@@ -70,7 +72,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Draft GitHub release
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: source
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "Modo ${GITHUB_REF_NAME#v}"
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "## Install"
+            echo
+            echo "- **macOS 12+**: download \`modo-$version-macos-universal.dmg\`, open it, and drag Modo to Applications. Modo is not notarized, so on first launch go to System Settings > Privacy & Security and click **Open Anyway** (or run \`xattr -dr com.apple.quarantine /Applications/Modo.app\`)."
+            echo "- **Windows 10+**: run \`modo-$version-windows-x64-setup.exe\`. If SmartScreen appears, choose More info > Run anyway."
+            echo "- **Ubuntu / Debian**: \`sudo apt install ./modo_${version}_amd64.deb\`"
+            echo "- **Other Linux**: extract \`modo-$version-linux-x86_64.tar.gz\` and run \`./modo\`."
+            echo
+            awk '/^## /{n++} n==1 && !/^## /' source/CHANGELOG.md
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "Modo $version" --notes-file notes.md --latest
