@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modo — review the code your agents wrote</title>
+<meta name="description" content="Modo is a fast, quiet desktop app for reading, reviewing, and editing the code your agents wrote. Native, no extensions, no language servers. macOS, Windows, and Linux.">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#191919" media="(prefers-color-scheme: dark)">
+<link rel="icon" type="image/png" href="media/icon.png">
+<link rel="apple-touch-icon" href="media/icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Modo — review the code your agents wrote">
+<meta property="og:description" content="A fast, quiet desktop app for reading, reviewing, and editing agent-written code.">
+<meta property="og:image" content="media/review.png">
+<meta name="twitter:card" content="summary_large_image">
+
+<script>
+  try {
+    var saved = localStorage.getItem("modo-theme");
+    if (saved === "light" || saved === "dark") document.documentElement.setAttribute("data-theme", saved);
+  } catch (e) {}
+</script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --bg-soft: #f8f8f7;
+    --fg: #37352f;
+    --muted: #787774;
+    --border: #ededec;
+    --accent: #2383e2;
+    --accent-hover: #0077d4;
+    --accent-fg: #ffffff;
+    --chip: rgba(55, 53, 47, 0.06);
+    --shadow: 0 1px 2px rgba(15, 15, 15, 0.04), 0 12px 40px rgba(15, 15, 15, 0.10);
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #191919;
+      --bg-soft: #202020;
+      --fg: #e6e6e4;
+      --muted: #9b9a97;
+      --border: #2f2f2f;
+      --chip: rgba(255, 255, 255, 0.07);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 40px rgba(0, 0, 0, 0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #191919;
+    --bg-soft: #202020;
+    --fg: #e6e6e4;
+    --muted: #9b9a97;
+    --border: #2f2f2f;
+    --chip: rgba(255, 255, 255, 0.07);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; }
+  img { max-width: 100%; display: block; }
+  code, kbd { font-family: var(--mono); font-size: 0.88em; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* Nav */
+  nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; text-decoration: none; letter-spacing: -0.01em; }
+  .brand img { width: 26px; height: 26px; border-radius: 6px; }
+  .nav-links { display: flex; align-items: center; gap: 22px; font-size: 14px; color: var(--muted); }
+  .nav-links a { text-decoration: none; }
+  .nav-links a:hover { color: var(--fg); }
+
+  /* Theme switcher */
+  .theme { display: inline-flex; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft); }
+  .theme button {
+    display: grid; place-items: center; width: 30px; height: 26px; padding: 0;
+    border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer;
+  }
+  .theme button:hover { color: var(--fg); }
+  .theme button[aria-pressed="true"] { background: var(--bg); color: var(--fg); box-shadow: 0 0 0 1px var(--border), 0 1px 2px rgba(15, 15, 15, 0.08); }
+  .theme svg { width: 15px; height: 15px; }
+  .theme button:focus-visible, .btn:focus-visible, .sticker:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* GitHub sticker + star */
+  .gh-star { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: var(--fg); }
+  .sticker.sm { width: 40px; margin: 0; border-width: 3px; border-radius: 32%; --tilt: -7deg; }
+  .sticker.sm > svg { width: 58%; height: 58%; }
+  .sticker.sm::before { background: linear-gradient(135deg, rgba(255, 255, 255, 0.32) 0%, rgba(255, 255, 255, 0) 38%); }
+  .s-gh { --c: #1f2328; box-shadow: 0 0 0 1px rgba(15, 15, 15, 0.10), 0 1px 0 rgba(15, 15, 15, 0.06), 0 6px 10px -3px rgba(15, 15, 15, 0.35); }
+  .gh-star:hover .sticker.sm { transform: rotate(0deg) translateY(-2px) scale(1.08); }
+  .star-pill {
+    display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 6px 0 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft);
+    font-size: 13.5px; font-weight: 500; color: var(--fg);
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .star-pill:not(:has(.count:not([hidden]))) { padding-right: 11px; }
+  .star-pill svg { width: 14px; height: 14px; color: var(--muted); transition: color 0.15s, transform 0.3s cubic-bezier(0.3, 1.8, 0.5, 1); }
+  .gh-star:hover .star-pill { background: var(--chip); }
+  .gh-star:hover .star-pill svg { color: #e3b341; transform: rotate(72deg) scale(1.15); }
+  .star-pill .count { padding: 1px 7px; border-radius: 999px; background: var(--chip); font-size: 12px; color: var(--muted); }
+  .gh-star:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    height: 44px; padding: 0 20px; border-radius: 8px;
+    font-size: 15px; font-weight: 500; text-decoration: none;
+    border: 1px solid transparent; cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .btn-primary { background: var(--accent); color: var(--accent-fg); }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-ghost { background: transparent; color: var(--fg); border-color: var(--border); }
+  .btn-ghost:hover { background: var(--chip); }
+  .btn-sm { height: 34px; padding: 0 14px; font-size: 14px; }
+
+  /* Hero */
+  .hero { text-align: center; padding: 72px 0 40px; }
+  .hero .icon { width: 84px; height: 84px; margin: 0 auto 28px; border-radius: 20px; box-shadow: var(--shadow); }
+  h1 {
+    font-size: clamp(36px, 6vw, 60px); line-height: 1.08;
+    letter-spacing: -0.035em; font-weight: 700; margin: 0 auto 20px; max-width: 16ch;
+  }
+  .lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 52ch; margin: 0 auto 32px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .hero-meta { margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .hero-meta a { color: var(--muted); }
+
+  .shot {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); overflow: hidden; background: var(--bg-soft);
+  }
+  .shot img { width: 100%; height: auto; }
+  .hero-shot { margin-top: 48px; }
+  .only-dark { display: none; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .only-light { display: none; }
+    :root:not([data-theme="light"]) .only-dark { display: block; }
+  }
+  :root[data-theme="dark"] .only-light { display: none; }
+  :root[data-theme="dark"] .only-dark { display: block; }
+
+  /* Sections */
+  section { padding: 72px 0; }
+  .eyebrow { font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+  h2 { font-size: clamp(26px, 3.6vw, 36px); letter-spacing: -0.025em; line-height: 1.15; margin: 0 0 14px; }
+  .sub { color: var(--muted); max-width: 56ch; margin: 0 0 40px; }
+
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .feature { background: var(--bg-soft); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
+  .feature h3 { font-size: 16px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .feature p { margin: 0; font-size: 14.5px; color: var(--muted); }
+
+  .split { display: grid; grid-template-columns: 5fr 7fr; gap: 48px; align-items: center; padding: 36px 0; }
+  .split.flip { grid-template-columns: 7fr 5fr; }
+  .split.flip .copy { order: 2; }
+  .split h2 { font-size: clamp(22px, 3vw, 30px); }
+  .split p { color: var(--muted); margin: 0 0 12px; }
+  .split ul { color: var(--muted); padding-left: 18px; margin: 0; }
+  .split li { margin: 4px 0; }
+
+  /* Install: die-cut stickers */
+  .downloads { display: grid; grid-template-columns: repeat(4, 1fr); gap: 44px 24px; padding-top: 8px; }
+  .dl { display: flex; flex-direction: column; align-items: center; text-align: center; }
+  .sticker {
+    --c: #111; --fg-logo: #fff;
+    position: relative; display: grid; place-items: center;
+    width: 132px; aspect-ratio: 1; margin-bottom: 18px;
+    border: 8px solid #fff; border-radius: 34%;
+    background: var(--c); color: var(--fg-logo);
+    box-shadow:
+      0 0 0 1px rgba(15, 15, 15, 0.10),
+      0 2px 0 rgba(15, 15, 15, 0.06),
+      0 14px 22px -6px rgba(15, 15, 15, 0.35);
+    transform: rotate(var(--tilt, 0deg));
+    transition: transform 0.22s cubic-bezier(0.3, 1.5, 0.5, 1), box-shadow 0.22s;
+    text-decoration: none;
+  }
+  .sticker > svg { width: 52%; height: 52%; position: relative; filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.18)); }
+  /* Glossy vinyl sheen */
+  .sticker::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background:
+      linear-gradient(135deg, rgba(255, 255, 255, 0.42) 0%, rgba(255, 255, 255, 0.08) 34%, rgba(255, 255, 255, 0) 35%),
+      radial-gradient(120% 80% at 80% 110%, rgba(0, 0, 0, 0.22), transparent 60%);
+  }
+  .sticker:hover, .dl.detected .sticker {
+    transform: rotate(0deg) translateY(-6px) scale(1.05);
+    box-shadow: 0 0 0 1px rgba(15, 15, 15, 0.10), 0 2px 0 rgba(15, 15, 15, 0.06), 0 22px 28px -8px rgba(15, 15, 15, 0.4);
+  }
+  .sticker:active { transform: rotate(0deg) scale(0.98); }
+  .s-mac { --c: #141414; --tilt: -5deg; }
+  .s-win { --c: #0a84e8; --tilt: 4deg; }
+  .s-deb { --c: #c70036; --tilt: -3deg; }
+  .s-linux { --c: #fcc624; --fg-logo: #141414; --tilt: 5deg; }
+  .s-linux > svg { filter: none; }
+  /* A small Ubuntu sticker stuck on the Debian one */
+  .sticker.mini {
+    position: absolute; right: -26px; bottom: -22px; margin: 0; width: 58px; border-width: 5px;
+    --c: #e95420; --tilt: 12deg; pointer-events: none;
+  }
+  .sticker-stack { position: relative; margin-bottom: 18px; }
+  .sticker-stack .sticker { margin-bottom: 0; }
+  .sticker-stack:hover .mini, .dl.detected .mini { transform: rotate(4deg) translate(3px, 2px) scale(1.05); }
+  .dl h3 { margin: 0; font-size: 17px; letter-spacing: -0.01em; }
+  .dl .file { margin: 2px 0 8px; font: 13px var(--mono); color: var(--muted); }
+  .dl .blurb { margin: 0 0 14px; font-size: 14px; color: var(--muted); max-width: 26ch; }
+  .dl .btn { margin-top: auto; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--accent); color: var(--accent-fg); margin-left: 8px; vertical-align: 2px; font-weight: 600; }
+  @media (prefers-reduced-motion: reduce) { .sticker { transition: none; } html { scroll-behavior: auto; } }
+
+  pre {
+    margin: 12px 0 0; padding: 14px 16px; overflow-x: auto;
+    background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px;
+    font: 13.5px/1.55 var(--mono);
+  }
+  .note { margin-top: 24px; padding: 18px 20px; border-radius: var(--radius); background: var(--bg-soft); border: 1px solid var(--border); font-size: 14.5px; }
+  .note strong { display: block; margin-bottom: 4px; }
+  .note p { margin: 0; color: var(--muted); }
+
+  .shortcuts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 48px; }
+  .shortcut { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 15px; }
+  kbd { background: var(--chip); border-radius: 5px; padding: 2px 8px; color: var(--fg); }
+
+  .closing { text-align: center; }
+  .closing .sub { margin-left: auto; margin-right: auto; }
+
+  footer { border-top: 1px solid var(--border); padding: 32px 0 48px; font-size: 14px; color: var(--muted); }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: space-between; }
+  footer a { text-decoration: none; margin-right: 18px; }
+  footer a:hover { color: var(--fg); }
+
+  @media (max-width: 820px) {
+    .features { grid-template-columns: 1fr 1fr; }
+    .split, .split.flip { grid-template-columns: 1fr; gap: 24px; }
+    .split.flip .copy { order: 0; }
+    .shortcuts { grid-template-columns: 1fr; }
+    .nav-links a.hide-sm { display: none; }
+    .downloads { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 540px) {
+    .nav-links a.nav-dl { display: none; }
+  }
+  @media (max-width: 480px) {
+    .nav-links { gap: 12px; }
+    .nav-links a.hide-xs { display: none; }
+    .sticker { width: 112px; }
+    .downloads { gap: 40px 12px; }
+  }
+  @media (max-width: 540px) {
+    .features { grid-template-columns: 1fr; }
+    .hero { padding-top: 40px; }
+    section { padding: 48px 0; }
+  }
+</style>
+</head>
+
+<body>
+<header class="wrap">
+  <nav>
+    <a class="brand" href="#top"><img src="media/icon.png" alt="" width="26" height="26">Modo</a>
+    <div class="nav-links">
+      <a class="hide-sm" href="#features">Features</a>
+      <a class="hide-sm" href="#install">Install</a>
+      <a class="gh-star" href="https://github.com/yesabhishek/modo" target="_blank" rel="noopener" aria-label="Star Modo on GitHub" title="Star Modo on GitHub">
+        <span class="sticker sm s-gh" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></span>
+        <span class="star-pill"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>Star<span class="count" id="star-count" hidden></span></span>
+      </a>
+      <div class="theme" role="group" aria-label="Color theme">
+        <button type="button" data-set-theme="light" aria-pressed="false" aria-label="Light theme" title="Light"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="2.9"/><path d="M8 1.5v1.4M8 13.1v1.4M1.5 8h1.4M13.1 8h1.4M3.4 3.4l1 1M11.6 11.6l1 1M3.4 12.6l1-1M11.6 4.4l1-1"/></svg></button>
+        <button type="button" data-set-theme="system" aria-pressed="true" aria-label="Match system theme" title="System"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.5" width="12.4" height="8.4" rx="1.4"/><path d="M5.5 13.6h5M8 10.9v2.7"/></svg></button>
+        <button type="button" data-set-theme="dark" aria-pressed="false" aria-label="Dark theme" title="Dark"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg></button>
+      </div>
+      <a class="btn btn-primary btn-sm nav-dl" href="#install">Download</a>
+    </div>
+  </nav>
+</header>
+
+<main id="top">
+  <div class="wrap hero">
+    <img class="icon" src="media/icon.png" alt="Modo app icon" width="84" height="84">
+    <h1>Review the code your agents wrote.</h1>
+    <p class="lede">Modo is a fast, quiet desktop app for reading, reviewing, and editing agent-written code. Native, no extensions, no language servers, no background indexer.</p>
+    <div class="cta">
+      <a class="btn btn-primary" id="hero-download" href="https://github.com/yesabhishek/modo/releases/latest">Download Modo</a>
+      <a class="btn btn-ghost" href="https://github.com/yesabhishek/modo">View on GitHub</a>
+    </div>
+    <p class="hero-meta" id="hero-meta">macOS 12+, Windows 10+, and Linux. Free and open source (MIT).</p>
+
+    <div class="shot hero-shot">
+      <img class="only-light" src="media/review.png" alt="Modo reviewing everything an agent changed on a branch, in one scrollable diff" width="1600" height="1018">
+      <img class="only-dark" src="media/terminal-dark.png" alt="Modo in the dark theme with the terminal open beneath a diff" width="1600" height="1018">
+    </div>
+  </div>
+
+  <section id="features">
+    <div class="wrap">
+      <p class="eyebrow">What it does</p>
+      <h2>Everything after the agent finishes.</h2>
+      <p class="sub">Agents write most of the code now. What you need afterwards is a place to see what changed, read it comfortably, fix a line, and run a command.</p>
+
+      <div class="features">
+        <div class="feature"><h3>Review agent work</h3><p>One scrollable diff of everything a branch changed since <code>main</code>, or any branch you pick. Unified or side by side, with word-level changes marked.</p></div>
+        <div class="feature"><h3>Read and edit</h3><p>Tree-sitter highlighting for over 25 languages, find and replace, multiple cursors, and saves that never overwrite changes made on disk.</p></div>
+        <div class="feature"><h3>Follow along live</h3><p>Files, the tree, and the review refresh on their own while an agent edits. Switch between git worktrees in one click.</p></div>
+        <div class="feature"><h3>Find anything</h3><p>Fuzzy file search, project-wide search on ripgrep's engine, and a command palette for everything else.</p></div>
+        <div class="feature"><h3>Run commands</h3><p>A real terminal with tabs and true color, in the shell you choose: zsh, bash, fish, PowerShell, Git Bash, WSL, or your own.</p></div>
+        <div class="feature"><h3>Looks calm</h3><p>Light, Dark, Paper, and Graphite themes, inspired by Notion. Markdown preview with Mermaid diagrams included.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section style="padding-top:0">
+    <div class="wrap">
+      <div class="split">
+        <div class="copy">
+          <p class="eyebrow">Review</p>
+          <h2>See the whole branch at once.</h2>
+          <p>Compare with <code>main</code>, any local or remote branch, or only your uncommitted work. Switch to split view when you need to see both sides.</p>
+          <ul>
+            <li>Word-level changes, syntax highlighted</li>
+            <li>Virtualized, so thousands of files stay smooth</li>
+            <li>Jump to any file, or double-click a line to edit it</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="media/review-split.png" alt="Side-by-side review of a branch" width="1600" height="1018"></div>
+      </div>
+
+      <div class="split flip">
+        <div class="copy">
+          <p class="eyebrow">Navigate</p>
+          <h2>Keyboard first, instantly.</h2>
+          <p>Go to a file, search the project, jump to a line, or switch projects without leaving the keyboard. Modo opens in a blink because there is nothing to index.</p>
+        </div>
+        <div class="shot"><img src="media/palette.png" alt="Go to file palette" width="1600" height="1018"></div>
+      </div>
+
+      <div class="split">
+        <div class="copy">
+          <p class="eyebrow">Themes</p>
+          <h2>Calm by default.</h2>
+          <p>Warm neutrals, quiet chrome, and soft hover fills. Pick Light, Dark, Paper, or Graphite in Settings.</p>
+        </div>
+        <div class="shot"><img src="media/search-paper.png" alt="Project search in the Paper theme" width="1600" height="1018"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" style="background:var(--bg-soft); border-top:1px solid var(--border); border-bottom:1px solid var(--border)">
+    <div class="wrap">
+      <p class="eyebrow">Install</p>
+      <h2>Download Modo<span id="version-label"></span></h2>
+      <p class="sub">Pick your platform. All builds are on the <a href="https://github.com/yesabhishek/modo/releases/latest">Releases page</a>.</p>
+
+      <div class="downloads">
+        <div class="dl" data-os="mac">
+          <a class="sticker s-mac" data-asset="mac" href="https://github.com/yesabhishek/modo/releases/latest" aria-label="Download Modo for macOS"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg></a>
+          <h3>macOS</h3>
+          <p class="file">.dmg · universal</p>
+          <p class="blurb">macOS 12+. Drag Modo to Applications, then see the first-launch note below.</p>
+          <a class="btn btn-primary btn-sm" data-asset="mac" href="https://github.com/yesabhishek/modo/releases/latest">Download</a>
+        </div>
+        <div class="dl" data-os="win">
+          <a class="sticker s-win" data-asset="win" href="https://github.com/yesabhishek/modo/releases/latest" aria-label="Download Modo for Windows"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M2 3.6 10.2 2.5v8.2H2zM11.3 2.35 22 .8v9.9H11.3zM2 11.8h8.2v8.2L2 18.9zM11.3 11.8H22v10.4l-10.7-1.5z"/></svg></a>
+          <h3>Windows</h3>
+          <p class="file">-setup.exe</p>
+          <p class="blurb">Windows 10+. Installs for your user and adds “Open with Modo”. If SmartScreen appears, choose More info, then Run anyway.</p>
+          <a class="btn btn-primary btn-sm" data-asset="win" href="https://github.com/yesabhishek/modo/releases/latest">Download</a>
+        </div>
+        <div class="dl" data-os="deb">
+          <div class="sticker-stack">
+            <a class="sticker s-deb" data-asset="deb" href="https://github.com/yesabhishek/modo/releases/latest" aria-label="Download Modo for Ubuntu or Debian"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M13.88 12.685c-.4 0 .08.2.601.28.14-.1.27-.22.39-.33a3.001 3.001 0 01-.99.05m2.14-.53c.23-.33.4-.69.47-1.06-.06.27-.2.5-.33.73-.75.47-.07-.27 0-.56-.8 1.01-.11.6-.14.89m.781-2.05c.05-.721-.14-.501-.2-.221.07.04.13.5.2.22M12.38.31c.2.04.45.07.42.12.23-.05.28-.1-.43-.12m.43.12l-.15.03.14-.01V.43m6.633 9.944c.02.64-.2.95-.38 1.5l-.35.181c-.28.54.03.35-.17.78-.44.39-1.34 1.22-1.62 1.301-.201 0 .14-.25.19-.34-.591.4-.481.6-1.371.85l-.03-.06c-2.221 1.04-5.303-1.02-5.253-3.842-.03.17-.07.13-.12.2a3.551 3.552 0 012.001-3.501 3.361 3.362 0 013.732.48 3.341 3.342 0 00-2.721-1.3c-1.18.01-2.281.76-2.651 1.57-.6.38-.67 1.47-.93 1.661-.361 2.601.66 3.722 2.38 5.042.27.19.08.21.12.35a4.702 4.702 0 01-1.53-1.16c.23.33.47.66.8.91-.55-.18-1.27-1.3-1.48-1.35.93 1.66 3.78 2.921 5.261 2.3a6.203 6.203 0 01-2.33-.28c-.33-.16-.77-.51-.7-.57a5.802 5.803 0 005.902-.84c.44-.35.93-.94 1.07-.95-.2.32.04.16-.12.44.44-.72-.2-.3.46-1.24l.24.33c-.09-.6.74-1.321.66-2.262.19-.3.2.3 0 .97.29-.74.08-.85.15-1.46.08.2.18.42.23.63-.18-.7.2-1.2.28-1.6-.09-.05-.28.3-.32-.53 0-.37.1-.2.14-.28-.08-.05-.26-.32-.38-.861.08-.13.22.33.34.34-.08-.42-.2-.75-.2-1.08-.34-.68-.12.1-.4-.3-.34-1.091.3-.25.34-.74.54.77.84 1.96.981 2.46-.1-.6-.28-1.2-.49-1.76.16.07-.26-1.241.21-.37A7.823 7.824 0 0017.702 1.6c.18.17.42.39.33.42-.75-.45-.62-.48-.73-.67-.61-.25-.65.02-1.06 0C15.082.73 14.862.8 13.8.4l.05.23c-.77-.25-.9.1-1.73 0-.05-.04.27-.14.53-.18-.741.1-.701-.14-1.431.03.17-.13.36-.21.55-.32-.6.04-1.44.35-1.18.07C9.6.68 7.847 1.3 6.867 2.22L6.838 2c-.45.54-1.96 1.611-2.08 2.311l-.131.03c-.23.4-.38.85-.57 1.261-.3.52-.45.2-.4.28-.6 1.22-.9 2.251-1.16 3.102.18.27 0 1.65.07 2.76-.3 5.463 3.84 10.776 8.363 12.006.67.23 1.65.23 2.49.25-.99-.28-1.12-.15-2.08-.49-.7-.32-.85-.7-1.34-1.13l.2.35c-.971-.34-.57-.42-1.361-.67l.21-.27c-.31-.03-.83-.53-.97-.81l-.34.01c-.41-.501-.63-.871-.61-1.161l-.111.2c-.13-.21-1.52-1.901-.8-1.511-.13-.12-.31-.2-.5-.55l.14-.17c-.35-.44-.64-1.02-.62-1.2.2.24.32.3.45.33-.88-2.172-.93-.12-1.601-2.202l.15-.02c-.1-.16-.18-.34-.26-.51l.06-.6c-.63-.74-.18-3.102-.09-4.402.07-.54.53-1.1.88-1.981l-.21-.04c.4-.71 2.341-2.872 3.241-2.761.43-.55-.09 0-.18-.14.96-.991 1.26-.7 1.901-.88.7-.401-.6.16-.27-.151 1.2-.3.85-.7 2.421-.85.16.1-.39.14-.52.26 1-.49 3.151-.37 4.562.27 1.63.77 3.461 3.011 3.531 5.132l.08.02c-.04.85.13 1.821-.17 2.711l.2-.42M9.54 13.236l-.05.28c.26.35.47.73.8 1.01-.24-.47-.42-.66-.75-1.3m.62-.02c-.14-.15-.22-.34-.31-.52.08.32.26.6.43.88l-.12-.36m10.945-2.382l-.07.15c-.1.76-.34 1.511-.69 2.212.4-.73.65-1.541.75-2.362M12.45.12c.27-.1.66-.05.95-.12-.37.03-.74.05-1.1.1l.15.02M3.006 5.142c.07.57-.43.8.11.42.3-.66-.11-.18-.1-.42m-.64 2.661c.12-.39.15-.62.2-.84-.35.44-.17.53-.2.83"/></svg></a>
+            <span class="sticker mini" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M17.61.455a3.41 3.41 0 0 0-3.41 3.41 3.41 3.41 0 0 0 3.41 3.41 3.41 3.41 0 0 0 3.41-3.41 3.41 3.41 0 0 0-3.41-3.41zM12.92.8C8.923.777 5.137 2.941 3.148 6.451a4.5 4.5 0 0 1 .26-.007 4.92 4.92 0 0 1 2.585.737A8.316 8.316 0 0 1 12.688 3.6 4.944 4.944 0 0 1 13.723.834 11.008 11.008 0 0 0 12.92.8zm9.226 4.994a4.915 4.915 0 0 1-1.918 2.246 8.36 8.36 0 0 1-.273 8.303 4.89 4.89 0 0 1 1.632 2.54 11.156 11.156 0 0 0 .559-13.089zM3.41 7.932A3.41 3.41 0 0 0 0 11.342a3.41 3.41 0 0 0 3.41 3.409 3.41 3.41 0 0 0 3.41-3.41 3.41 3.41 0 0 0-3.41-3.41zm2.027 7.866a4.908 4.908 0 0 1-2.915.358 11.1 11.1 0 0 0 7.991 6.698 11.234 11.234 0 0 0 2.422.249 4.879 4.879 0 0 1-.999-2.85 8.484 8.484 0 0 1-.836-.136 8.304 8.304 0 0 1-5.663-4.32zm11.405.928a3.41 3.41 0 0 0-3.41 3.41 3.41 3.41 0 0 0 3.41 3.41 3.41 3.41 0 0 0 3.41-3.41 3.41 3.41 0 0 0-3.41-3.41z"/></svg></span>
+          </div>
+          <h3>Ubuntu / Debian</h3>
+          <p class="file">.deb · amd64</p>
+          <p class="blurb"><code>sudo apt install ./modo_*.deb</code></p>
+          <a class="btn btn-primary btn-sm" data-asset="deb" href="https://github.com/yesabhishek/modo/releases/latest">Download</a>
+        </div>
+        <div class="dl" data-os="linux">
+          <a class="sticker s-linux" data-asset="linux" href="https://github.com/yesabhishek/modo/releases/latest" aria-label="Download Modo for Linux"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.132 1.884 1.071.771-.06 1.592-.536 2.257-1.306.631-.765 1.683-1.084 2.378-1.503.348-.199.629-.469.649-.853.023-.4-.2-.811-.714-1.376v-.097l-.003-.003c-.17-.2-.25-.535-.338-.926-.085-.401-.182-.786-.492-1.046h-.003c-.059-.054-.123-.067-.188-.135a.357.357 0 00-.19-.064c.431-1.278.264-2.55-.173-3.694-.533-1.41-1.465-2.638-2.175-3.483-.796-1.005-1.576-1.957-1.56-3.368.026-2.152.236-6.133-3.544-6.139zm.529 3.405h.013c.213 0 .396.062.584.198.19.135.33.332.438.533.105.259.158.459.166.724 0-.02.006-.04.006-.06v.105a.086.086 0 01-.004-.021l-.004-.024a1.807 1.807 0 01-.15.706.953.953 0 01-.213.335.71.71 0 00-.088-.042c-.104-.045-.198-.064-.284-.133a1.312 1.312 0 00-.22-.066c.05-.06.146-.133.183-.198.053-.128.082-.264.088-.402v-.02a1.21 1.21 0 00-.061-.4c-.045-.134-.101-.2-.183-.333-.084-.066-.167-.132-.267-.132h-.016c-.093 0-.176.03-.262.132a.8.8 0 00-.205.334 1.18 1.18 0 00-.09.4v.019c.002.089.008.179.02.267-.193-.067-.438-.135-.607-.202a1.635 1.635 0 01-.018-.2v-.02a1.772 1.772 0 01.15-.768c.082-.22.232-.406.43-.533a.985.985 0 01.594-.2zm-2.962.059h.036c.142 0 .27.048.399.135.146.129.264.288.344.465.09.199.14.4.153.667v.004c.007.134.006.2-.002.266v.08c-.03.007-.056.018-.083.024-.152.055-.274.135-.393.2.012-.09.013-.18.003-.267v-.015c-.012-.133-.04-.2-.082-.333a.613.613 0 00-.166-.267.248.248 0 00-.183-.064h-.021c-.071.006-.13.04-.186.132a.552.552 0 00-.12.27.944.944 0 00-.023.33v.015c.012.135.037.2.08.334.046.134.098.2.166.268.01.009.02.018.034.024-.07.057-.117.07-.176.136a.304.304 0 01-.131.068 2.62 2.62 0 01-.275-.402 1.772 1.772 0 01-.155-.667 1.759 1.759 0 01.08-.668 1.43 1.43 0 01.283-.535c.128-.133.26-.2.418-.2zm1.37 1.706c.332 0 .733.065 1.216.399.293.2.523.269 1.052.468h.003c.255.136.405.266.478.399v-.131a.571.571 0 01.016.47c-.123.31-.516.643-1.063.842v.002c-.268.135-.501.333-.775.465-.276.135-.588.292-1.012.267a1.139 1.139 0 01-.448-.067 3.566 3.566 0 01-.322-.198c-.195-.135-.363-.332-.612-.465v-.005h-.005c-.4-.246-.616-.512-.686-.71-.07-.268-.005-.47.193-.6.224-.135.38-.271.483-.336.104-.074.143-.102.176-.131h.002v-.003c.169-.202.436-.47.839-.601.139-.036.294-.065.466-.065zm2.8 2.142c.358 1.417 1.196 3.475 1.735 4.473.286.534.855 1.659 1.102 3.024.156-.005.33.018.513.064.646-1.671-.546-3.467-1.089-3.966-.22-.2-.232-.335-.123-.335.59.534 1.365 1.572 1.646 2.757.13.535.16 1.104.021 1.67.067.028.135.06.205.067 1.032.534 1.413.938 1.23 1.537v-.043c-.06-.003-.12 0-.18 0h-.016c.151-.467-.182-.825-1.065-1.224-.915-.4-1.646-.336-1.77.465-.008.043-.013.066-.018.135-.068.023-.139.053-.209.064-.43.268-.662.669-.793 1.187-.13.533-.17 1.156-.205 1.869v.003c-.02.334-.17.838-.319 1.35-1.5 1.072-3.58 1.538-5.348.334a2.645 2.645 0 00-.402-.533 1.45 1.45 0 00-.275-.333c.182 0 .338-.03.465-.067a.615.615 0 00.314-.334c.108-.267 0-.697-.345-1.163-.345-.467-.931-.995-1.788-1.521-.63-.4-.986-.87-1.15-1.396-.165-.534-.143-1.085-.015-1.645.245-1.07.873-2.11 1.274-2.763.107-.065.037.135-.408.974-.396.751-1.14 2.497-.122 3.854a8.123 8.123 0 01.647-2.876c.564-1.278 1.743-3.504 1.836-5.268.048.036.217.135.289.202.218.133.38.333.59.465.21.201.477.335.876.335.039.003.075.006.11.006.412 0 .73-.134.997-.268.29-.134.52-.334.74-.4h.005c.467-.135.835-.402 1.044-.7zm2.185 8.958c.037.6.343 1.245.882 1.377.588.134 1.434-.333 1.791-.765l.211-.01c.315-.007.577.01.847.268l.003.003c.208.199.305.53.391.876.085.4.154.78.409 1.066.486.527.645.906.636 1.14l.003-.007v.018l-.003-.012c-.015.262-.185.396-.498.595-.63.401-1.746.712-2.457 1.57-.618.737-1.37 1.14-2.036 1.191-.664.053-1.237-.2-1.574-.898l-.005-.003c-.21-.4-.12-1.025.056-1.69.176-.668.428-1.344.463-1.897.037-.714.076-1.335.195-1.814.12-.465.308-.797.641-.984l.045-.022zm-10.814.049h.01c.053 0 .105.005.157.014.376.055.706.333 1.023.752l.91 1.664.003.003c.243.533.754 1.064 1.189 1.637.434.598.77 1.131.729 1.57v.006c-.057.744-.48 1.148-1.125 1.294-.645.135-1.52.002-2.395-.464-.968-.536-2.118-.469-2.857-.602-.369-.066-.61-.2-.723-.4-.11-.2-.113-.602.123-1.23v-.004l.002-.003c.117-.334.03-.752-.027-1.118-.055-.401-.083-.71.043-.94.16-.334.396-.4.69-.533.294-.135.64-.202.915-.47h.002v-.002c.256-.268.445-.601.668-.838.19-.201.38-.336.663-.336zm7.159-9.074c-.435.201-.945.535-1.488.535-.542 0-.97-.267-1.28-.466-.154-.134-.28-.268-.373-.335-.164-.134-.144-.333-.074-.333.109.016.129.134.199.2.096.066.215.2.36.333.292.2.68.467 1.167.467.485 0 1.053-.267 1.398-.466.195-.135.445-.334.648-.467.156-.136.149-.267.279-.267.128.016.034.134-.147.332a8.097 8.097 0 01-.69.468zm-1.082-1.583V5.64c-.006-.02.013-.042.029-.05.074-.043.18-.027.26.004.063 0 .16.067.15.135-.006.049-.085.066-.135.066-.055 0-.092-.043-.141-.068-.052-.018-.146-.008-.163-.065zm-.551 0c-.02.058-.113.049-.166.066-.047.025-.086.068-.14.068-.05 0-.13-.02-.136-.068-.01-.066.088-.133.15-.133.08-.031.184-.047.259-.005.019.009.036.03.03.05v.02h.003z"/></svg></a>
+          <h3>Other Linux</h3>
+          <p class="file">.tar.gz · x86_64</p>
+          <p class="blurb">Extract, then put <code>modo</code> on your PATH. Runs on X11 and Wayland.</p>
+          <a class="btn btn-primary btn-sm" data-asset="linux" href="https://github.com/yesabhishek/modo/releases/latest">Download</a>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>First launch on macOS</strong>
+        <p>Modo is not notarized by Apple, so macOS blocks the first launch. Open it once, then go to System Settings &gt; Privacy &amp; Security and click <em>Open Anyway</em>. Or run this once:</p>
+        <pre>xattr -dr com.apple.quarantine /Applications/Modo.app</pre>
+      </div>
+
+      <div class="note">
+        <strong>Build from source</strong>
+        <p>You need <a href="https://rustup.rs">Rust</a> and Git (macOS or Linux):</p>
+        <pre>git clone https://github.com/yesabhishek/modo.git &amp;&amp; cd modo
+scripts/install.sh</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="eyebrow">Use it</p>
+      <h2>Open a folder. Press one key.</h2>
+      <p class="sub">Open a project from a terminal, or drop a folder on the app, then review what your agent did.</p>
+      <pre style="margin:0 0 32px">modo .</pre>
+
+      <div class="shortcuts">
+        <div class="shortcut"><span>Review changes</span><span><kbd data-mac="⌘⇧G" data-pc="Ctrl+Shift+G">⌘⇧G</kbd></span></div>
+        <div class="shortcut"><span>Go to file</span><span><kbd data-mac="⌘P" data-pc="Ctrl+P">⌘P</kbd></span></div>
+        <div class="shortcut"><span>Command palette</span><span><kbd data-mac="⌘K" data-pc="Ctrl+K">⌘K</kbd></span></div>
+        <div class="shortcut"><span>Search in files</span><span><kbd data-mac="⌘⇧F" data-pc="Ctrl+Shift+F">⌘⇧F</kbd></span></div>
+        <div class="shortcut"><span>Terminal</span><span><kbd data-mac="⌘J" data-pc="Ctrl+J">⌘J</kbd></span></div>
+        <div class="shortcut"><span>Markdown preview</span><span><kbd data-mac="⌘⇧V" data-pc="Ctrl+Shift+V">⌘⇧V</kbd></span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="closing" style="padding-top:24px">
+    <div class="wrap">
+      <h2>Quiet tools for loud agents.</h2>
+      <p class="sub">Free, open source, and about 9,500 lines of Rust on GPUI.</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="#install">Download Modo</a>
+        <a class="btn btn-ghost" href="https://github.com/yesabhishek/modo">Star on GitHub</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/yesabhishek/modo">GitHub</a>
+      <a href="https://github.com/yesabhishek/modo/releases">Releases</a>
+      <a href="https://github.com/yesabhishek/modo/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/yesabhishek/modo/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+      <a href="https://github.com/yesabhishek/modo/issues">Issues</a>
+    </div>
+    <div>MIT licensed.</div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var REPO = "yesabhishek/modo";
+  var ua = navigator.userAgent || "";
+  var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  var mobile = /Android|iPhone|iPad|iPod/.test(ua);
+  var os = mobile ? ""
+         : /mac/i.test(platform) || /Mac OS X/.test(ua) ? "mac"
+         : /win/i.test(platform) || /Windows/.test(ua) ? "win"
+         : /linux|x11/i.test(platform) || /Linux/.test(ua) ? "linux" : "";
+  var labels = { mac: "Download for macOS", win: "Download for Windows", linux: "Download for Linux", deb: "Download for Linux" };
+
+  // Theme switcher: Light, Dark, or follow the system (no attribute set).
+  var root = document.documentElement;
+  var buttons = document.querySelectorAll("[data-set-theme]");
+  function showTheme(choice) {
+    buttons.forEach(function (b) { b.setAttribute("aria-pressed", String(b.getAttribute("data-set-theme") === choice)); });
+  }
+  var current = root.getAttribute("data-theme") || "system";
+  showTheme(current);
+  buttons.forEach(function (b) {
+    b.addEventListener("click", function () {
+      var choice = b.getAttribute("data-set-theme");
+      if (choice === "system") root.removeAttribute("data-theme");
+      else root.setAttribute("data-theme", choice);
+      try {
+        if (choice === "system") localStorage.removeItem("modo-theme");
+        else localStorage.setItem("modo-theme", choice);
+      } catch (e) {}
+      showTheme(choice);
+    });
+  });
+
+  // Show Ctrl-style shortcuts off macOS.
+  if (os !== "mac") {
+    document.querySelectorAll("kbd[data-pc]").forEach(function (k) { k.textContent = k.getAttribute("data-pc"); });
+  }
+
+  // Highlight the visitor's platform.
+  var card = document.querySelector('.dl[data-os="' + (os === "linux" ? "deb" : os) + '"]');
+  if (card) {
+    card.classList.add("detected");
+    var title = card.querySelector("h3");
+    if (title) title.insertAdjacentHTML("beforeend", '<span class="tag">Your system</span>');
+  }
+
+  var hero = document.getElementById("hero-download");
+  if (os && labels[os]) hero.textContent = labels[os];
+
+  // Live star count (hidden when zero or if the API is unavailable).
+  fetch("https://api.github.com/repos/" + REPO, { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (repo) {
+      var n = repo.stargazers_count;
+      if (!n) return;
+      var el = document.getElementById("star-count");
+      el.textContent = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, "") + "k" : String(n);
+      el.hidden = false;
+    })
+    .catch(function () {});
+
+  // Resolve direct links from the latest release; fall back to the releases page.
+  var patterns = {
+    mac: /macos-universal\.dmg$/,
+    win: /windows-x64-setup\.exe$/,
+    deb: /_amd64\.deb$/,
+    linux: /linux-x86_64\.tar\.gz$/
+  };
+  fetch("https://api.github.com/repos/" + REPO + "/releases/latest", { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (rel) {
+      var urls = {};
+      (rel.assets || []).forEach(function (a) {
+        Object.keys(patterns).forEach(function (k) {
+          if (patterns[k].test(a.name)) urls[k] = a.browser_download_url;
+        });
+      });
+      document.querySelectorAll("a[data-asset]").forEach(function (a) {
+        var u = urls[a.getAttribute("data-asset")];
+        if (u) a.href = u;
+      });
+      var key = os === "linux" ? "deb" : os;
+      if (key && urls[key]) {
+        hero.href = urls[key];
+        if (os === "linux" && urls.linux) hero.href = urls.deb || urls.linux;
+      }
+      var v = (rel.tag_name || "").replace(/^v/, "");
+      if (v) {
+        document.getElementById("version-label").textContent = " " + v;
+        document.getElementById("hero-meta").innerHTML =
+          "Version " + v + " · macOS 12+, Windows 10+, and Linux · Free and open source (MIT) · " +
+          '<a href="https://github.com/' + REPO + '/blob/main/CHANGELOG.md">What’s new</a>';
+      }
+    })
+    .catch(function () { /* keep the releases-page links */ });
+})();
+</script>
+</body>
+</html>
