@@ -138,8 +138,22 @@
   .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
   .hero-meta { margin-top: 16px; font-size: 13px; color: var(--muted); }
   .hero-meta a { color: var(--muted); }
-  .ph-badge { margin-top: 24px; display: flex; justify-content: center; }
+  /* Product Hunt badge: always the original orange one, in the navbar; under the hero on phones */
+  .ph-nav { display: inline-flex; align-items: center; line-height: 0; }
+  .ph-nav img { height: 36px; width: auto; display: block; }
+  .ph-fallback {
+    display: none; align-items: center; height: 32px; padding: 0 12px; border-radius: 8px;
+    background: #ff6154; color: #fff; font-size: 13px; font-weight: 600; line-height: 1; white-space: nowrap;
+  }
+  .ph-nav.failed img { display: none; }
+  .ph-nav.failed .ph-fallback { display: inline-flex; }
+  .nav-links a.ph-nav:hover { opacity: 0.9; }
+  .ph-badge { display: none; margin-top: 24px; justify-content: center; }
   .ph-badge a { display: inline-block; line-height: 0; }
+  @media (max-width: 640px) {
+    .nav-links a.ph-nav { display: none; }
+    .ph-badge { display: flex; }
+  }
 
   .shot {
     border: 1px solid var(--border); border-radius: var(--radius);
@@ -275,6 +289,7 @@
   <nav>
     <a class="brand" href="#top"><img src="media/icon.png" alt="" width="26" height="26">Modo</a>
     <div class="nav-links">
+      <a class="ph-nav" href="https://www.producthunt.com/products/modo-4?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-modo-4" target="_blank" rel="noopener noreferrer" aria-label="Modo on Product Hunt"><img alt="Modo - Modo is a fast, quiet desktop app for reading, reviewing, | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1296801&amp;theme=light&amp;t=1793256321060"><span class="ph-fallback">Find us on Product Hunt</span></a>
       <a class="hide-sm" href="#features">Features</a>
       <a class="hide-sm" href="#install">Install</a>
       <a class="gh-star" href="https://github.com/yesabhishek/modo" target="_blank" rel="noopener" aria-label="Star Modo on GitHub" title="Star Modo on GitHub">
@@ -303,7 +318,7 @@
     <p class="hero-meta" id="hero-meta">macOS 12+, Windows 10+, and Linux. Free and open source (MIT).</p>
 
     <div class="ph-badge">
-      <a href="https://www.producthunt.com/products/modo-4?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-modo-4" target="_blank" rel="noopener noreferrer"><img class="only-light" alt="Modo - Modo is a fast, quiet desktop app for reading, reviewing, | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1296801&amp;theme=light&amp;t=1793256321060"><img class="only-dark" alt="Modo - Modo is a fast, quiet desktop app for reading, reviewing, | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1296801&amp;theme=dark&amp;t=1793256321060"></a>
+      <a href="https://www.producthunt.com/products/modo-4?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-modo-4" target="_blank" rel="noopener noreferrer"><img alt="Modo - Modo is a fast, quiet desktop app for reading, reviewing, | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1296801&amp;theme=light&amp;t=1793256321060"></a>
     </div>
 
     <div class="shot hero-shot">
@@ -495,6 +510,15 @@ scripts/install.sh</pre>
       showTheme(choice);
     });
   });
+
+  // If the badge image is blocked (ad blockers often block Product Hunt), show a plain link instead.
+  var ph = document.querySelector(".ph-nav");
+  if (ph) {
+    var phImg = ph.querySelector("img");
+    var phFail = function () { ph.classList.add("failed"); };
+    phImg.addEventListener("error", phFail);
+    window.addEventListener("load", function () { if (phImg.complete && phImg.naturalWidth === 0) phFail(); });
+  }
 
   // Show Ctrl-style shortcuts off macOS.
   if (os !== "mac") {
