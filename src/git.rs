@@ -297,6 +297,8 @@ pub enum ReviewScope {
     Uncommitted,
     /// Everything this branch changed since it left `base`, committed or not.
     Branch(String),
+    /// Only the changes introduced by one commit, relative to its first parent.
+    Commit(String),
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +373,28 @@ pub fn branches(root: &Path) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone)]
+pub struct Commit {
+    pub id: String,
+    pub subject: String,
+}
+
+pub fn recent_commits(root: &Path) -> Vec<Commit> {
+    let Ok(output) = run(root, ["log", "-30", "--format=%H%x00%s", "--"]) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.bytes)
+        .lines()
+        .filter_map(|line| {
+            let (id, subject) = line.split_once('\0')?;
+            Some(Commit {
+                id: id.to_owned(),
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn resolve(root: &Path, rev: &str) -> Option<String> {
     let out = run(
         root,
@@ -389,8 +413,17 @@ fn resolve(root: &Path, rev: &str) -> Option<String> {
 
 /// One unified patch for every change in scope, ready for the review surface.
 pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, String> {
-    let base = match &scope {
-        ReviewScope::Uncommitted => resolve(root, "HEAD").unwrap_or_else(|| EMPTY_TREE.to_owned()),
+    let (base, target) = match &scope {
+        ReviewScope::Commit(revision) => {
+            let commit = resolve(root, revision).ok_or("Cannot find this commit.")?;
+            let parent =
+                resolve(root, &format!("{commit}^")).unwrap_or_else(|| EMPTY_TREE.to_owned());
+            (parent, Some(commit))
+        }
+        ReviewScope::Uncommitted => (
+            resolve(root, "HEAD").unwrap_or_else(|| EMPTY_TREE.to_owned()),
+            None,
+        ),
         ReviewScope::Branch(base) => {
             let head = resolve(root, "HEAD").ok_or("This branch has no commits yet.")?;
             let base_commit =
@@ -399,26 +432,32 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
             if !merge_base.success {
                 return Err(format!("{base} and this branch share no history."));
             }
-            String::from_utf8_lossy(&merge_base.bytes).trim().to_owned()
+            (
+                String::from_utf8_lossy(&merge_base.bytes).trim().to_owned(),
+                None,
+            )
         }
     };
-    let tracked = run_capped(
-        root,
-        [
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--find-renames",
-            "--unified=3",
-            &base,
-            "--",
-        ],
-        MAX_PATCH,
-    )?;
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        "--unified=3",
+        &base,
+    ];
+    if let Some(target) = &target {
+        args.push(target);
+    }
+    args.push("--");
+    let tracked = run_capped(root, args, MAX_PATCH)?;
     if !tracked.success {
         return Err(tracked.error);
     }
     let mut patch = String::from_utf8_lossy(&tracked.bytes).into_owned();
+    if target.is_some() {
+        return Ok(ReviewPatch { patch, skipped: 0 });
+    }
     let untracked = run(root, ["ls-files", "--others", "--exclude-standard", "-z"])?;
     let mut skipped = 0;
     let mut included = 0;
@@ -611,6 +650,25 @@ mod tests {
         let uncommitted = review_patch(dir.path(), ReviewScope::Uncommitted).unwrap();
         assert!(!uncommitted.patch.contains("fn agent"));
     }
+    #[test]
+    fn individual_commit_review_excludes_local_work_and_handles_the_root_commit() {
+        let dir = repository();
+        let initial = recent_commits(dir.path())[0].id.clone();
+        let first = review_patch(dir.path(), ReviewScope::Commit(initial)).unwrap();
+        assert!(first.patch.contains("file.txt"));
+        std::fs::write(dir.path().join("committed.rs"), "fn shipped() {}\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "Add feature"]);
+        let commits = recent_commits(dir.path());
+        std::fs::write(dir.path().join("local.rs"), "not committed\n").unwrap();
+        std::fs::write(dir.path().join("file.txt"), "unstaged\n").unwrap();
+        let review = review_patch(dir.path(), ReviewScope::Commit(commits[0].id.clone())).unwrap();
+        assert!(review.patch.contains("fn shipped()"));
+        assert!(!review.patch.contains("local.rs"));
+        assert!(!review.patch.contains("unstaged"));
+        assert_eq!(commits[0].subject, "Add feature");
+    }
+
     #[test]
     fn any_branch_can_be_the_review_base() {
         let dir = repository();

@@ -36,6 +36,11 @@ fn act(f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 's
 fn click(window: &mut Window, x: f32, y: f32, cx: &mut App) {
     let position = point(px(x), px(y));
     let modifiers = Modifiers::default();
+    let button = if std::env::var("MODO_CAPTURE_BUTTON").is_ok_and(|button| button == "right") {
+        MouseButton::Right
+    } else {
+        MouseButton::Left
+    };
     // Move first so hover and hit testing see the pointer where it presses.
     window.dispatch_event(
         PlatformInput::MouseMove(MouseMoveEvent {
@@ -48,7 +53,7 @@ fn click(window: &mut Window, x: f32, y: f32, cx: &mut App) {
     window.draw(cx).clear(cx);
     window.dispatch_event(
         PlatformInput::MouseDown(MouseDownEvent {
-            button: MouseButton::Left,
+            button,
             position,
             modifiers,
             click_count: 1,
@@ -58,7 +63,7 @@ fn click(window: &mut Window, x: f32, y: f32, cx: &mut App) {
     );
     window.dispatch_event(
         PlatformInput::MouseUp(MouseUpEvent {
-            button: MouseButton::Left,
+            button,
             position,
             modifiers,
             click_count: 1,
@@ -73,12 +78,15 @@ fn theme_from_env() -> Option<ThemeChoice> {
         "dark" => ThemeChoice::Dark,
         "paper" => ThemeChoice::Paper,
         "graphite" => ThemeChoice::Graphite,
+        "midnight" => ThemeChoice::Midnight,
+        "black" => ThemeChoice::Black,
         _ => ThemeChoice::System,
     })
 }
 
 fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
     let want_preview = scene == "preview";
+    let want_reviewed = scene == "review-progress";
     let scene = scene.to_owned();
     let settle = std::env::var("MODO_CAPTURE_DELAY_MS")
         .ok()
@@ -87,19 +95,50 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
     let mut steps = vec![
         Step::Wait(900),
         act(move |ws, window, cx| {
-            if let Some(file) = file {
-                ws.open_file(file, None, window, cx);
-            }
             match scene.as_str() {
-                "review" | "review-split" => {
+                "review" | "review-split" | "review-progress" => {
                     if scene == "review-split" {
                         Settings::update(cx, |s| s.review_layout = ReviewLayout::Split);
                     }
                     ws.panel = Panel::Changes;
                     ws.open_review(window, cx);
                 }
+                "todos" => {
+                    ws.panel = Panel::Todos;
+                    ws.start_todos(cx);
+                }
+                "terminal-split" => {
+                    ws.terminal.update(cx, |terminal, cx| {
+                        terminal.split(crate::ui::terminal::SplitAxis::Horizontal, window, cx);
+                        terminal.split(crate::ui::terminal::SplitAxis::Vertical, window, cx);
+                    });
+                }
+                "project-gradient-settings" => {
+                    ws.window_color = Some(true);
+                    ws.open_settings(window, cx);
+                }
+                "project-gradient-terminal" => {
+                    ws.window_color = Some(true);
+                    ws.terminal
+                        .update(cx, |terminal, cx| terminal.show(window, cx));
+                    cx.notify();
+                }
+                "terminal-full" => ws
+                    .terminal
+                    .update(cx, |terminal, cx| terminal.toggle_maximized(window, cx)),
+                "window-color" | "project-gradient" => {
+                    ws.window_color = Some(true);
+                    cx.notify();
+                }
                 "palette" => ws.open_palette("", window, cx),
                 "commands" => ws.open_palette(">", window, cx),
+                "about" => crate::ui::about::open(window, cx),
+                "settings-about" => {
+                    ws.open_settings(window, cx);
+                    if let Some(view) = ws.settings.clone() {
+                        view.update(cx, |view, cx| view.show_about(cx));
+                    }
+                }
                 "settings" => ws.open_settings(window, cx),
                 "settings-terminal" => {
                     ws.open_settings(window, cx);
@@ -116,12 +155,41 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
                 }
                 _ => {}
             }
+            if let Some(recent) = std::env::var_os("MODO_CAPTURE_RECENT") {
+                let mut session = crate::settings::Session::get(cx).clone();
+                session.recent = std::env::split_paths(&recent).collect();
+                cx.set_global(session);
+            }
             if std::env::var_os("MODO_CAPTURE_TERMINAL").is_some() {
                 ws.terminal.update(cx, |t, cx| t.show(window, cx));
             }
         }),
         Step::Wait(settle),
     ];
+    if let Some(file) = file {
+        steps.insert(
+            1,
+            act(move |ws, window, cx| ws.open_file(file, None, window, cx)),
+        );
+        steps.insert(2, Step::Wait(400));
+    }
+    if want_reviewed {
+        steps.extend([
+            act(|ws, _, cx| {
+                let path = ws
+                    .review
+                    .read(cx)
+                    .files()
+                    .first()
+                    .map(|file| file.path.clone());
+                if let Some(path) = path {
+                    ws.review
+                        .update(cx, |review, cx| review.toggle_reviewed(&path, cx));
+                }
+            }),
+            Step::Wait(400),
+        ]);
+    }
     // `MODO_CAPTURE_CLICK=x,y` clicks a control, such as a menu, before the shot.
     if let Some((x, y)) = std::env::var("MODO_CAPTURE_CLICK").ok().and_then(|at| {
         let (x, y) = at.split_once(',')?;
@@ -286,10 +354,17 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
     }
     // Settings observers activate after this startup cycle, so apply directly.
     crate::theme::apply(None, cx);
+    let (width, height) = std::env::var("MODO_CAPTURE_SIZE")
+        .ok()
+        .and_then(|value| {
+            let (width, height) = value.split_once('x')?;
+            Some((width.parse::<f32>().ok()?, height.parse::<f32>().ok()?))
+        })
+        .unwrap_or((1320., 840.));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(1320.), px(840.)),
+            size(px(width), px(height)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {

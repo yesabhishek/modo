@@ -22,9 +22,9 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Anchor, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Element, ElementId,
-    Empty, Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
-    InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, LayoutId,
+    Anchor, AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Element,
+    ElementId, Empty, Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId,
+    Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels,
     Point, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Style,
     Styled, Task, TextAlign, TextRun, WeakEntity, Window, actions, div, fill, outline, point,
@@ -97,8 +97,94 @@ impl Render for PanelResize {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone)]
+enum Pane {
+    Terminal(Entity<TerminalView>),
+    Split(SplitAxis, Box<Pane>, Box<Pane>),
+}
+
+impl Pane {
+    fn contains(&self, view: &Entity<TerminalView>) -> bool {
+        match self {
+            Self::Terminal(leaf) => leaf == view,
+            Self::Split(_, a, b) => a.contains(view) || b.contains(view),
+        }
+    }
+    fn split(&mut self, target: &Entity<TerminalView>, new: Entity<TerminalView>, axis: SplitAxis) {
+        match self {
+            Self::Terminal(leaf) if leaf == target => {
+                *self = Self::Split(axis, Box::new(self.clone()), Box::new(Self::Terminal(new)));
+            }
+            Self::Split(_, a, b) => {
+                if a.contains(target) {
+                    a.split(target, new, axis);
+                } else {
+                    b.split(target, new, axis);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn without(self, target: &Entity<TerminalView>) -> Option<Self> {
+        match self {
+            Self::Terminal(leaf) => (leaf != *target).then_some(Self::Terminal(leaf)),
+            Self::Split(axis, a, b) => match (a.without(target), b.without(target)) {
+                (Some(a), Some(b)) => Some(Self::Split(axis, Box::new(a), Box::new(b))),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+    fn render(&self, cx: &App) -> AnyElement {
+        match self {
+            Self::Terminal(view) => div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .size_full()
+                .child(view.clone())
+                .into_any_element(),
+            Self::Split(axis, a, b) => div()
+                .flex()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .when(*axis == SplitAxis::Horizontal, |d| d.flex_row())
+                .when(*axis == SplitAxis::Vertical, |d| d.flex_col())
+                .gap(px(2.))
+                .bg(cx.theme().border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .bg(cx.theme().background)
+                        .child(a.render(cx)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .bg(cx.theme().background)
+                        .child(b.render(cx)),
+                )
+                .into_any_element(),
+        }
+    }
+}
+
 pub struct TerminalPanel {
     pub open: bool,
+    pub maximized: bool,
+    panes: Vec<Pane>,
     height: f32,
     sessions: Vec<Entity<TerminalView>>,
     active: usize,
@@ -110,6 +196,8 @@ impl TerminalPanel {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             open: false,
+            maximized: false,
+            panes: Vec::new(),
             height: 260.,
             sessions: Vec::new(),
             active: 0,
@@ -126,8 +214,8 @@ impl TerminalPanel {
         self.open
             && self
                 .sessions
-                .get(self.active)
-                .is_some_and(|s| s.read(cx).focus.contains_focused(window, cx))
+                .iter()
+                .any(|s| s.read(cx).focus.contains_focused(window, cx))
     }
 
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -150,6 +238,28 @@ impl TerminalPanel {
         } else {
             self.show(window, cx);
         }
+    }
+
+    pub fn toggle_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.maximized = !self.open || !self.maximized;
+        self.show(window, cx);
+    }
+
+    pub fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(window, cx);
+        let Some(target) = self.sessions.get(self.active).cloned() else {
+            return;
+        };
+        let Some(group) = self.panes.iter().position(|pane| pane.contains(&target)) else {
+            return;
+        };
+        self.new_session(window, cx);
+        let Some(new) = self.sessions.last().cloned() else {
+            return;
+        };
+        self.panes.pop();
+        self.panes[group].split(&target, new, axis);
+        cx.notify();
     }
 
     pub fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -178,6 +288,17 @@ impl TerminalPanel {
             let handle = view.read(cx).focus.clone();
             handle.focus(window, cx)
         };
+        let focused = view.downgrade();
+        cx.on_focus(&view.read(cx).focus.clone(), window, move |this, _, cx| {
+            if let Some(focused) = focused.upgrade()
+                && let Some(ix) = this.sessions.iter().position(|view| view == &focused)
+            {
+                this.active = ix;
+            }
+            cx.notify();
+        })
+        .detach();
+        self.panes.push(Pane::Terminal(view.clone()));
         self.sessions.push(view);
         self.active = self.sessions.len() - 1;
         self.open = true;
@@ -187,11 +308,19 @@ impl TerminalPanel {
     fn remove(&mut self, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
         if let Some(ix) = self.sessions.iter().position(|s| s == view) {
             self.sessions.remove(ix);
+            self.panes = std::mem::take(&mut self.panes)
+                .into_iter()
+                .filter_map(|pane| pane.without(view))
+                .collect();
+            if self.active > ix {
+                self.active -= 1;
+            }
             if self.active >= self.sessions.len() {
                 self.active = self.sessions.len().saturating_sub(1);
             }
             if self.sessions.is_empty() {
                 self.open = false;
+                self.maximized = false;
             }
             cx.notify();
         }
@@ -209,10 +338,13 @@ impl TerminalPanel {
         }
     }
 
-    pub fn close_active(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.sessions.get(self.active).cloned() {
             view.update(cx, |view, _| view.shutdown());
             self.remove(&view, cx);
+            if let Some(next) = self.sessions.get(self.active) {
+                next.read(cx).focus.clone().focus(window, cx);
+            }
         }
     }
 }
@@ -275,22 +407,24 @@ impl Render for TerminalPanel {
         v_flex()
             .id("terminal-panel")
             .relative()
-            .flex_none()
-            .h(px(height))
+            .when(self.maximized, |panel| panel.flex_1().min_h_0())
+            .when(!self.maximized, |panel| panel.flex_none().h(px(height)))
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .child(
-                div()
-                    .id("terminal-resize")
-                    .absolute()
-                    .top(px(-3.))
-                    .left_0()
-                    .right_0()
-                    .h(px(6.))
-                    .cursor_row_resize()
-                    .on_drag(PanelResize, |_, _, _, cx| cx.new(|_| PanelResize)),
-            )
+            .when(!self.maximized, |panel| {
+                panel.child(
+                    div()
+                        .id("terminal-resize")
+                        .absolute()
+                        .top(px(-3.))
+                        .left_0()
+                        .right_0()
+                        .h(px(6.))
+                        .cursor_row_resize()
+                        .on_drag(PanelResize, |_, _, _, cx| cx.new(|_| PanelResize)),
+                )
+            })
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<PanelResize>, _, cx| {
                     let bottom: f32 = event.bounds.bottom().into();
@@ -313,7 +447,13 @@ impl Render for TerminalPanel {
                             .text_color(theme.muted_foreground)
                             .child("Terminal"),
                     )
-                    .children(tabs)
+                    .child(
+                        h_flex()
+                            .id("terminal-tabs")
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .children(tabs),
+                    )
                     .child(
                         icon_button("term-new", IconName::Plus, cx)
                             .size(r(22.))
@@ -328,6 +468,54 @@ impl Render for TerminalPanel {
                     .child(profile_menu(cx.entity().downgrade(), cx))
                     .child(div().flex_1())
                     .child(
+                        icon_button(
+                            "term-split-horizontal",
+                            gpui_kit::assets::IconName::Columns2,
+                            cx,
+                        )
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(
+                                "Split terminal side by side",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.split(SplitAxis::Horizontal, window, cx)
+                        })),
+                    )
+                    .child(
+                        icon_button("term-split-vertical", gpui_kit::assets::IconName::Rows2, cx)
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(
+                                    "Split terminal above and below",
+                                )
+                                .build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.split(SplitAxis::Vertical, window, cx)
+                            })),
+                    )
+                    .child(
+                        icon_button(
+                            "term-maximize",
+                            if self.maximized {
+                                gpui_kit::assets::IconName::Minimize2
+                            } else {
+                                gpui_kit::assets::IconName::Maximize2
+                            },
+                            cx,
+                        )
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(
+                                "Toggle full-window terminal",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_maximized(window, cx)),
+                        ),
+                    )
+                    .child(
                         icon_button("term-hide", IconName::ChevronDown, cx)
                             .size(r(22.))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -337,12 +525,12 @@ impl Render for TerminalPanel {
                     ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when_some(self.sessions.get(self.active).cloned(), |d, view| {
-                        d.child(view)
-                    }),
+                div().flex_1().min_h_0().when_some(
+                    self.sessions
+                        .get(self.active)
+                        .and_then(|active| self.panes.iter().find(|pane| pane.contains(active))),
+                    |d, pane| d.child(pane.render(cx)),
+                ),
             )
     }
 }

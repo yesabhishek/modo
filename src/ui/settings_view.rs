@@ -19,12 +19,14 @@ use gpui_kit::{
 
 use super::{r, shortcut};
 use crate::{
-    brand,
     settings::{ReviewBase, ReviewLayout, Settings, ThemeChoice},
     shells,
 };
 
-pub struct Close;
+pub enum SettingsEvent {
+    Close,
+    ProjectGradient(bool),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
@@ -70,15 +72,16 @@ impl Category {
 pub struct SettingsView {
     focus: FocusHandle,
     category: Category,
+    gradient_enabled: bool,
     font_input: Entity<InputState>,
     shell_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
-impl EventEmitter<Close> for SettingsView {}
+impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(gradient_enabled: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = Settings::get(cx).clone();
         let default_font = crate::theme::mono_font("", cx);
         let font_input = cx.new(|cx| {
@@ -130,10 +133,22 @@ impl SettingsView {
         Self {
             focus: cx.focus_handle(),
             category: Category::Appearance,
+            gradient_enabled,
             font_input,
             shell_input,
             _subscriptions: subscriptions,
         }
+    }
+
+    #[cfg(feature = "capture")]
+    pub fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.category = Category::About;
+        cx.notify();
+    }
+
+    pub fn set_gradient_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.gradient_enabled = enabled;
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -152,6 +167,34 @@ impl SettingsView {
             Category::Appearance => vec![
                 heading("Theme", cx),
                 theme_picker(s.theme, cx),
+                row(
+                    "Project gradients",
+                    "A subtle background gradient across the app, unique to each project.",
+                    Switch::new("project-gradients")
+                        .checked(self.gradient_enabled)
+                        .on_click(cx.listener(|this, enabled: &bool, _, cx| {
+                            this.gradient_enabled = *enabled;
+                            Settings::update(cx, |settings| settings.window_colors = *enabled);
+                            cx.emit(SettingsEvent::ProjectGradient(*enabled));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    cx,
+                ),
+                toggle(
+                    "Show hidden files",
+                    "Include files and folders whose names start with a dot.",
+                    s.show_hidden_files,
+                    |s, v| s.show_hidden_files = v,
+                    cx,
+                ),
+                toggle(
+                    "Show ignored files",
+                    "Show files excluded by .ignore and .gitignore with muted labels.",
+                    s.show_ignored_files,
+                    |s, v| s.show_ignored_files = v,
+                    cx,
+                ),
                 row(
                     "Interface size",
                     "Scales text and controls across the whole window.",
@@ -314,7 +357,49 @@ impl SettingsView {
                 }
                 rows
             }
-            Category::About => vec![about(cx)],
+            Category::About => vec![
+                heading("About", cx),
+                div()
+                    .pt(r(18.))
+                    .pb(r(16.))
+                    .child(super::about::identity(cx))
+                    .into_any_element(),
+                super::about::publisher(cx),
+                heading("Updates", cx),
+                toggle(
+                    "Automatic updates",
+                    "Check for new releases at startup and install them in the background.",
+                    s.auto_update,
+                    |s, v| s.auto_update = v,
+                    cx,
+                ),
+                heading("Resources", cx),
+                div()
+                    .pt(r(12.))
+                    .child(super::about::resources(cx))
+                    .into_any_element(),
+                row(
+                    "Startup log",
+                    "Launch timings and update diagnostics.",
+                    Button::new("about-startup-log")
+                        .outline()
+                        .small()
+                        .label("Open log")
+                        .on_click(|_, _, _| {
+                            if let Some(dir) = crate::settings::config_dir() {
+                                let _ = open::that(dir.join("startup.log"));
+                            }
+                        })
+                        .into_any_element(),
+                    cx,
+                ),
+                div()
+                    .pt(r(8.))
+                    .text_size(r(11.5))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Built with Rust and GPUI · MIT license")
+                    .into_any_element(),
+            ],
         }
     }
 }
@@ -330,6 +415,7 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Go to line", "⌃G", "Ctrl+G"),
     ("Toggle terminal", "⌘J  or  ⌃`", "Ctrl+J  or  Ctrl+`"),
     ("New terminal", "⌃⇧`", "Ctrl+Shift+`"),
+    ("Full-window terminal", "⌘⇧J", "Ctrl+Shift+J"),
     ("Toggle sidebar", "⌘B", "Ctrl+B"),
     ("Save", "⌘S", "Ctrl+S"),
     ("Close tab", "⌘W", "Ctrl+W"),
@@ -547,6 +633,8 @@ fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
             ThemeChoice::Dark => (hex(0x191919), hex(0x202020), hex(0xD4D4D4), hex(0x2F2F2F)),
             ThemeChoice::Paper => (hex(0xFBFAF6), hex(0xF3F1EA), hex(0x3A362E), hex(0xE6E1D6)),
             ThemeChoice::Graphite => (hex(0x1E1F22), hex(0x18191B), hex(0xD6D7DB), hex(0x2E2F33)),
+            ThemeChoice::Midnight => (hex(0x0D0F14), hex(0x090B10), hex(0xD6D7DB), hex(0x232732)),
+            ThemeChoice::Black => (hex(0x000000), hex(0x080808), hex(0xD6D7DB), hex(0x252525)),
         }
     };
     let mini = |choice: ThemeChoice| {
@@ -662,55 +750,6 @@ fn shortcut_row(label: &'static str, keys: &'static str, cx: &App) -> AnyElement
         .into_any_element()
 }
 
-fn about(cx: &App) -> AnyElement {
-    let theme = cx.theme().clone();
-    v_flex()
-        .pt(r(36.))
-        .items_center()
-        .gap(r(10.))
-        .child(super::welcome::logo(r(64.), cx))
-        .child(
-            div()
-                .text_size(r(22.))
-                .font_weight(FontWeight::BOLD)
-                .child(brand::NAME),
-        )
-        .child(
-            div()
-                .text_size(r(13.5))
-                .text_color(theme.muted_foreground)
-                .child(brand::TAGLINE),
-        )
-        .child(
-            div()
-                .text_size(r(12.5))
-                .text_color(theme.muted_foreground)
-                .child(format!("Version {}", brand::VERSION)),
-        )
-        .child(
-            div()
-                .id("about-repo")
-                .pt(r(6.))
-                .text_size(r(13.))
-                .text_color(theme.primary)
-                .cursor_pointer()
-                .child("Source code and releases")
-                .on_click(|_, _, cx| cx.open_url(brand::REPOSITORY)),
-        )
-        .child(
-            div()
-                .pt(r(24.))
-                .max_w(r(420.))
-                .text_center()
-                .text_size(r(12.))
-                .text_color(theme.muted_foreground)
-                .child(
-                    "Built in Rust on GPUI. No extensions, no telemetry, no background indexer.",
-                ),
-        )
-        .into_any_element()
-}
-
 impl Focusable for SettingsView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -735,14 +774,21 @@ impl Render for SettingsView {
             .size_full()
             .track_focus(&self.focus)
             .key_context("Settings")
-            .on_action(cx.listener(|_, _: &super::workspace::Dismiss, _, cx| cx.emit(Close)))
+            .on_action(
+                cx.listener(|_, _: &super::workspace::Dismiss, _, cx| {
+                    cx.emit(SettingsEvent::Close)
+                }),
+            )
             .child(
                 div()
                     .id("settings-backdrop")
                     .absolute()
                     .inset_0()
                     .bg(theme.overlay)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(Close))),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)),
+                    ),
             )
             .child(
                 div()
@@ -788,18 +834,18 @@ impl Render for SettingsView {
                                 v_flex()
                                     .id("settings-content")
                                     .flex_1()
+                                    .min_w_0()
                                     .h_full()
                                     .px(r(40.))
                                     .pb(r(32.))
                                     .overflow_y_scroll()
                                     .children(content),
                             )
-                            .child(
-                                div().absolute().top(r(12.)).right(r(12.)).child(
-                                    super::icon_button("settings-close", IconName::Close, cx)
-                                        .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
+                            .child(div().absolute().top(r(12.)).right(r(12.)).child(
+                                super::icon_button("settings-close", IconName::Close, cx).on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)),
                                 ),
-                            ),
+                            )),
                     ),
             )
     }

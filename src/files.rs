@@ -14,6 +14,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub directory: bool,
+    pub ignored: bool,
 }
 
 impl Entry {
@@ -43,6 +44,16 @@ pub const HEAVY_DIRS: &[&str] = &[
 ];
 
 pub fn read_directory(path: &Path) -> Result<Vec<Entry>, String> {
+    // A shallow walker applies .ignore, .gitignore, nested rules and global
+    // excludes with the same precedence as search, without traversing children.
+    let visible: std::collections::HashSet<PathBuf> = ignore::WalkBuilder::new(path)
+        .hidden(false)
+        .require_git(false)
+        .max_depth(Some(1))
+        .build()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .collect();
     let mut entries = Vec::new();
     for entry in fs::read_dir(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))? {
         let Ok(entry) = entry else { continue };
@@ -53,6 +64,7 @@ pub fn read_directory(path: &Path) -> Result<Vec<Entry>, String> {
         // Symlinked folders stay leaves so a link cycle cannot recurse forever.
         let directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         entries.push(Entry {
+            ignored: !visible.contains(&entry.path()),
             path: entry.path(),
             name,
             directory,
@@ -342,6 +354,65 @@ mod tests {
             ["z-dir", "A.rs", "b.rs", "file2.rs", "file10.rs"]
         );
         assert!(entries[0].directory);
+    }
+
+    #[test]
+    fn tree_honors_nested_ignore_rules_and_negations() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::write(dir.path().join(".ignore"), "private.txt\n").unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/.ignore"), "!keep.log\n").unwrap();
+        for name in ["private.txt", "debug.log", "public.rs"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        for name in ["keep.log", "hidden.log", "main.rs"] {
+            fs::write(dir.path().join("src").join(name), "").unwrap();
+        }
+        let entries = read_directory(dir.path()).unwrap();
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.name == "private.txt")
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.name == "debug.log")
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            !entries
+                .iter()
+                .find(|entry| entry.name == "public.rs")
+                .unwrap()
+                .ignored
+        );
+        let nested = read_directory(&dir.path().join("src")).unwrap();
+        assert!(
+            !nested
+                .iter()
+                .find(|entry| entry.name == "keep.log")
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            nested
+                .iter()
+                .find(|entry| entry.name == "hidden.log")
+                .unwrap()
+                .ignored
+        );
+        assert!(
+            !nested
+                .iter()
+                .find(|entry| entry.name == "main.rs")
+                .unwrap()
+                .ignored
+        );
     }
 
     #[test]

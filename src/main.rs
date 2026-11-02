@@ -12,8 +12,11 @@ mod git;
 mod search;
 mod settings;
 mod shells;
+mod startup;
 mod theme;
+mod todos;
 mod ui;
+mod updater;
 
 use std::{path::PathBuf, sync::OnceLock, time::Instant};
 
@@ -133,6 +136,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Save All", ws::SaveAll),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", ws::CloseTab),
+                MenuItem::action("Close All Tabs", ws::CloseAllTabs),
+                MenuItem::action("Close Other Tabs", ws::CloseOtherTabs),
+                MenuItem::action("Close Tabs to the Left", ws::CloseTabsLeft),
+                MenuItem::action("Close Tabs to the Right", ws::CloseTabsRight),
                 MenuItem::action("Close Window", ws::CloseWindow),
             ],
             disabled: false,
@@ -163,6 +170,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Review Changes", ws::ReviewChanges),
                 MenuItem::action("Toggle Sidebar", ws::ToggleSidebar),
                 MenuItem::action("Toggle Terminal", ws::ToggleTerminal),
+                MenuItem::action("Full-window Terminal", ws::MaximizeTerminal),
+                MenuItem::action("Split Terminal Side by Side", ws::SplitTerminalHorizontal),
+                MenuItem::action("Split Terminal Above and Below", ws::SplitTerminalVertical),
+                MenuItem::action("To-dos", ws::ShowTodos),
+                MenuItem::action("Toggle Project Gradient", ws::ToggleWindowColor),
                 MenuItem::action("Toggle Word Wrap", ws::ToggleSoftWrap),
                 MenuItem::action("Toggle Markdown Preview", ws::ToggleMarkdownPreview),
                 MenuItem::separator(),
@@ -284,6 +296,7 @@ fn main() {
         ui::workspace::init(cx);
         ui::terminal::init(cx);
         ui::palette::init(cx);
+        updater::init(cx);
         cx.set_menus(menus());
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() && !cfg!(target_os = "macos") {

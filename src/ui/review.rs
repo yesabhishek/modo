@@ -1,6 +1,9 @@
 //! Review: everything an agent changed, as one virtualized, syntax-highlighted
 //! diff: either uncommitted work or the whole branch since it left its base.
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -32,6 +35,7 @@ pub enum ReviewEvent {
     OpenFile(PathBuf, Option<u32>),
     /// The user picked what to compare against; worth remembering per project.
     BaseChanged,
+    ProgressChanged,
 }
 
 #[derive(Clone)]
@@ -39,6 +43,7 @@ pub struct ReviewFile {
     pub path: SharedString,
     pub additions: usize,
     pub deletions: usize,
+    pub reviewed: bool,
     pub badge: &'static str,
 }
 
@@ -58,9 +63,13 @@ pub struct Review {
     chosen: Option<String>,
     /// Branches offered as bases, most recent first.
     branches: Vec<String>,
+    commits: Vec<git::Commit>,
+    commit: Option<String>,
     scope: ReviewBase,
     state: Entity<DiffState>,
     files: Vec<ReviewFile>,
+    reviewed: HashMap<String, String>,
+    fingerprints: HashMap<String, String>,
     loading: bool,
     loaded: bool,
     error: Option<SharedString>,
@@ -70,6 +79,8 @@ pub struct Review {
     _task: Option<Task<()>>,
     reload_task: Option<Task<()>>,
     branch_task: Option<Task<()>>,
+    base_task: Option<Task<()>>,
+    base_loading: bool,
     /// Frames left to redraw after new files arrive: the diff list measures its
     /// viewport while drawing, so its width settles on the following frame.
     settle_frames: u8,
@@ -87,9 +98,13 @@ impl Review {
             base: None,
             chosen: None,
             branches: Vec::new(),
+            commits: Vec::new(),
+            commit: None,
             scope: settings.review_base,
             state,
             files: Vec::new(),
+            reviewed: HashMap::new(),
+            fingerprints: HashMap::new(),
             loading: false,
             loaded: false,
             error: None,
@@ -99,6 +114,8 @@ impl Review {
             _task: None,
             reload_task: None,
             branch_task: None,
+            base_task: None,
+            base_loading: false,
             settle_frames: 0,
         }
     }
@@ -118,6 +135,24 @@ impl Review {
         chosen: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.reviewed = root
+            .as_ref()
+            .and_then(|root| crate::settings::Session::get(cx).project(root))
+            .map(|s| s.reviewed_files.clone())
+            .unwrap_or_default();
+        self.commit = root
+            .as_ref()
+            .and_then(|root| crate::settings::Session::get(cx).project(root))
+            .and_then(|session| session.review_commit.clone());
+        self.commits.clear();
+        self.fingerprints.clear();
+        self.generation += 1;
+        self._task = None;
+        self.reload_task = None;
+        self.branch_task = None;
+        self.base_task = None;
+        self.base_loading = false;
+        self.loading = false;
         self.root = root;
         self.repo = None;
         self.base = None;
@@ -136,13 +171,16 @@ impl Review {
         if first && let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) {
             self.load_branches(cx);
             // Finding the base is a couple of Git calls; keep it off the UI thread.
-            self._task = Some(cx.spawn(async move |this, cx| {
+            self.base_loading = true;
+            self.base_task = Some(cx.spawn(async move |this, cx| {
                 let base = cx
                     .background_executor()
                     .spawn(async move { git::default_base(&root) })
                     .await;
                 this.update(cx, |this, cx| {
                     this.base = base;
+                    this.base_loading = false;
+                    this.loading = false;
                     if this.loaded {
                         this.reload(cx);
                     }
@@ -181,16 +219,63 @@ impl Review {
             return;
         };
         self.branch_task = Some(cx.spawn(async move |this, cx| {
-            let branches = cx
+            let (branches, commits) = cx
                 .background_executor()
-                .spawn(async move { git::branches(&root) })
+                .spawn(async move { (git::branches(&root), git::recent_commits(&root)) })
                 .await;
             this.update(cx, |this, cx| {
                 this.branches = branches;
+                this.commits = commits;
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    pub fn reviewed_files(&self) -> HashMap<String, String> {
+        self.reviewed.clone()
+    }
+
+    pub fn is_reviewed(&self, path: &str) -> bool {
+        self.fingerprints
+            .get(path)
+            .is_some_and(|fingerprint| self.reviewed.get(path) == Some(fingerprint))
+    }
+
+    pub fn toggle_reviewed(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
+        let Some(fingerprint) = self.fingerprints.get(path).cloned() else {
+            return;
+        };
+        if self.is_reviewed(path) {
+            self.reviewed.remove(path);
+        } else {
+            self.reviewed.insert(path.to_owned(), fingerprint);
+        }
+        let reviewed = self.is_reviewed(path);
+        if let Some(file) = self
+            .files
+            .iter_mut()
+            .find(|file| file.path.as_ref() == path)
+        {
+            file.reviewed = reviewed;
+        }
+        self.state
+            .update(cx, |state, cx| state.set_file_collapsed(path, reviewed, cx));
+        cx.emit(ReviewEvent::ProgressChanged);
+        cx.notify();
+    }
+
+    pub fn chosen_commit(&self) -> Option<String> {
+        self.commit.clone()
+    }
+
+    pub fn choose_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        self.commit = Some(commit);
+        cx.emit(ReviewEvent::BaseChanged);
+        self.reload(cx);
     }
 
     pub fn chosen_base(&self) -> Option<String> {
@@ -201,6 +286,9 @@ impl Review {
         let Some(repo) = self.repo.as_ref() else {
             return ReviewScope::Uncommitted;
         };
+        if let Some(commit) = &self.commit {
+            return ReviewScope::Commit(commit.clone());
+        }
         if self.scope == ReviewBase::Uncommitted {
             return ReviewScope::Uncommitted;
         }
@@ -218,6 +306,16 @@ impl Review {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.base_loading
+            && self.scope == ReviewBase::Branch
+            && self.chosen.is_none()
+            && self.commit.is_none()
+        {
+            self.loaded = true;
+            self.loading = true;
+            cx.notify();
+            return;
+        }
         let Some(root) = self
             .repo
             .as_ref()
@@ -235,6 +333,13 @@ impl Review {
         self.generation += 1;
         let generation = self.generation;
         let scope = self.effective_scope();
+        let context = format!(
+            "{}:{scope:?}",
+            self.repo
+                .as_ref()
+                .map(|r| r.branch.as_str())
+                .unwrap_or_default()
+        );
         self.loading = true;
         cx.notify();
         self._task = Some(cx.spawn(async move |this, cx| {
@@ -242,6 +347,7 @@ impl Review {
                 .background_executor()
                 .spawn(async move {
                     let review = git::review_patch(&root, scope)?;
+                    let fingerprints = patch_fingerprints(&review.patch, &context);
                     let parsed = DiffFile::parse(&review.patch).map_err(|e| e.to_string())?;
                     let files: Vec<DiffFile> = parsed
                         .into_iter()
@@ -250,7 +356,7 @@ impl Review {
                             file.with_language(language)
                         })
                         .collect();
-                    Ok::<_, String>((files, review.skipped))
+                    Ok::<_, String>((files, review.skipped, fingerprints))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -260,13 +366,22 @@ impl Review {
                 this.loading = false;
                 this.loaded = true;
                 match result {
-                    Ok((files, skipped)) => {
+                    Ok((files, skipped, fingerprints)) => {
+                        this.fingerprints = files
+                            .iter()
+                            .zip(fingerprints)
+                            .map(|(file, fingerprint)| (file.path().to_string(), fingerprint))
+                            .collect();
+                        this.reviewed.retain(|path, fingerprint| {
+                            this.fingerprints.get(path) == Some(fingerprint)
+                        });
                         this.error = None;
                         this.skipped = skipped;
                         this.files = files
                             .iter()
                             .map(|f| ReviewFile {
                                 path: f.path().clone(),
+                                reviewed: this.is_reviewed(f.path().as_ref()),
                                 additions: f.additions(),
                                 deletions: f.deletions(),
                                 badge: match f.status() {
@@ -278,8 +393,15 @@ impl Review {
                                 },
                             })
                             .collect();
-                        this.state
-                            .update(cx, |state, cx| state.set_files(files, cx));
+                        this.state.update(cx, |state, cx| {
+                            state.set_files(files, cx);
+                            for file in &this.files {
+                                if file.reviewed {
+                                    state.set_file_collapsed(&file.path, true, cx);
+                                }
+                            }
+                        });
+                        cx.emit(ReviewEvent::ProgressChanged);
                         this.settle_frames = 2;
                     }
                     Err(error) => this.error = Some(error.into()),
@@ -298,9 +420,10 @@ impl Review {
             ReviewBase::Uncommitted
         };
         let chosen = branch.or_else(|| self.chosen.clone());
-        if self.scope == scope && self.chosen == chosen {
+        if self.scope == scope && self.chosen == chosen && self.commit.is_none() {
             return;
         }
+        self.commit = None;
         self.scope = scope;
         self.chosen = chosen;
         Settings::update(cx, |s| s.review_base = scope);
@@ -344,10 +467,18 @@ impl Review {
             "Loading changes…".into()
         } else if self.files.is_empty() {
             "No changes".into()
-        } else if self.files.len() == 1 {
-            "1 file changed".into()
         } else {
-            format!("{} files changed", self.files.len()).into()
+            format!(
+                "{} {} changed · {} reviewed",
+                self.files.len(),
+                if self.files.len() == 1 {
+                    "file"
+                } else {
+                    "files"
+                },
+                self.files.iter().filter(|f| f.reviewed).count()
+            )
+            .into()
         };
         Summary {
             label,
@@ -361,6 +492,9 @@ impl Review {
     fn compare_label(&self) -> SharedString {
         match self.effective_scope() {
             ReviewScope::Branch(base) => format!("Since {base}").into(),
+            ReviewScope::Commit(commit) => {
+                format!("Commit {}", &commit[..commit.len().min(8)]).into()
+            }
             ReviewScope::Uncommitted => "Uncommitted changes".into(),
         }
     }
@@ -424,6 +558,22 @@ fn compare_menu(
                 PopupMenuItem::new(label)
                     .checked(checked)
                     .on_click(pick(Some(base))),
+            );
+        }
+        if !this.commits.is_empty() {
+            menu = menu.separator().label("Recent commits");
+        }
+        for commit in &this.commits {
+            let review = review.clone();
+            let id = commit.id.clone();
+            menu = menu.item(
+                PopupMenuItem::new(format!("{} {}", &id[..id.len().min(8)], commit.subject))
+                    .checked(current == ReviewScope::Commit(id.clone()))
+                    .on_click(move |_, _, cx| {
+                        if let Some(review) = review.upgrade() {
+                            review.update(cx, |review, cx| review.choose_commit(id.clone(), cx));
+                        }
+                    }),
             );
         }
         menu
@@ -661,6 +811,7 @@ impl Render for Review {
                     "This branch matches {base}. When an agent edits files, they show up here."
                 )
                 .into(),
+                ReviewScope::Commit(_) => "This commit contains no file changes.".into(),
                 ReviewScope::Uncommitted => {
                     "Everything is committed. When an agent edits files, they show up here.".into()
                 }
@@ -670,6 +821,8 @@ impl Render for Review {
             let root = self.repo.as_ref().map(|r| r.root.clone());
             let entity = cx.entity().downgrade();
             let open_root = root.clone();
+            let reviewed = self.reviewed.clone();
+            let fingerprints = self.fingerprints.clone();
             Diff::new(&self.state)
                 .hover_highlight(DiffHoverHighlight::Both)
                 .hunk_separator(DiffHunkSeparator::Simple)
@@ -683,25 +836,57 @@ impl Render for Review {
                     let entity = entity.clone();
                     let deleted = file.status() == DiffFileStatus::Deleted;
                     let hover = cx.theme().list_hover;
-                    div()
-                        .id(SharedString::from(format!("open-{}", file.path())))
-                        .px(r(8.))
-                        .h(r(22.))
-                        .flex()
-                        .items_center()
-                        .rounded(r(5.))
-                        .text_size(r(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .when(!deleted, |d| {
-                            d.cursor_pointer()
-                                .hover(move |s| s.bg(hover))
-                                .child("Open file")
-                        })
-                        .on_click(move |_, _, cx| {
-                            if let (Some(path), Some(entity)) = (path.clone(), entity.upgrade()) {
-                                entity
-                                    .update(cx, |_, cx| cx.emit(ReviewEvent::OpenFile(path, None)));
-                            }
+                    let file_path = file.path().to_string();
+                    let checked = fingerprints
+                        .get(&file_path)
+                        .is_some_and(|fingerprint| reviewed.get(&file_path) == Some(fingerprint));
+                    let review_entity = entity.clone();
+                    h_flex()
+                        .gap(r(6.))
+                        .child(
+                            Button::new(SharedString::from(format!("reviewed-{file_path}")))
+                                .ghost()
+                                .xsmall()
+                                .label(if checked { "Reviewed" } else { "Mark reviewed" })
+                                .icon(if checked {
+                                    Lucide::Check
+                                } else {
+                                    Lucide::Square
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(entity) = review_entity.upgrade() {
+                                        entity.update(cx, |review, cx| {
+                                            review.toggle_reviewed(&file_path, cx)
+                                        });
+                                    }
+                                }),
+                        )
+                        .when(!deleted, |row| {
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("open-{}", file.path())))
+                                    .px(r(8.))
+                                    .h(r(22.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(r(5.))
+                                    .text_size(r(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover))
+                                    .child("Open file")
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        if let (Some(path), Some(entity)) =
+                                            (path.clone(), entity.upgrade())
+                                        {
+                                            entity.update(cx, |_, cx| {
+                                                cx.emit(ReviewEvent::OpenFile(path, None))
+                                            });
+                                        }
+                                    }),
+                            )
                         })
                 })
                 .on_line_click({
@@ -762,4 +947,39 @@ pub fn empty_state(
                 .text_color(theme.muted_foreground)
                 .child(detail),
         )
+}
+
+// Hash each raw file patch, including metadata and the comparison context.
+// Equal line counts do not imply the content was already reviewed.
+fn patch_fingerprints(patch: &str, context: &str) -> Vec<String> {
+    if patch.is_empty() {
+        return Vec::new();
+    }
+    patch
+        .strip_prefix("diff --git ")
+        .unwrap_or(patch)
+        .split("\ndiff --git ")
+        .map(|part| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(context.as_bytes());
+            hash.update(&[0]);
+            hash.update(part.trim_end_matches('\n').as_bytes());
+            hash.finalize().to_hex().to_string()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::patch_fingerprints;
+    #[test]
+    fn changing_one_file_or_comparison_invalidates_only_its_review() {
+        let patch = "diff --git a/a b/a\n-old\n+new\ndiff --git a/b b/b\n-one\n+two\n";
+        let original = patch_fingerprints(patch, "main");
+        let changed = patch_fingerprints(&patch.replace("+new", "+NEW"), "main");
+        assert_ne!(original[0], changed[0]);
+        assert_eq!(original[1], changed[1]);
+        assert_ne!(original, patch_fingerprints(patch, "other"));
+        assert!(patch_fingerprints("", "main").is_empty());
+    }
 }

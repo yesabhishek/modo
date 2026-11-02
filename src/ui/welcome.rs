@@ -198,6 +198,14 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                     ),
             )
             .child(action_row(
+                "e-open",
+                Lucide::FolderOpen,
+                "Open folder…",
+                shortcut("⌘O", "Ctrl+O"),
+                Box::new(OpenFolder),
+                cx,
+            ))
+            .child(action_row(
                 "e-review",
                 Lucide::GitCompare,
                 if changes > 0 {

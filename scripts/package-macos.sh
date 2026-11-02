@@ -64,6 +64,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>modo</string>
   <key>CFBundleShortVersionString</key><string>${version%%-*}</string>
+  <key>NSHumanReadableCopyright</key><string>Published by Abhishek Choudhury (https://www.abhishekchoudhury.com)</string>
   <key>CFBundleVersion</key><string>${version%%-*}</string>
   <key>LSMinimumSystemVersion</key><string>$MACOSX_DEPLOYMENT_TARGET</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>

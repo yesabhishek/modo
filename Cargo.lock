@@ -4251,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "modo"
-version = "0.2.2"
+version = "0.3.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4270,8 +4270,10 @@ dependencies = [
  "nucleo-matcher",
  "open",
  "resvg 0.46.0",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

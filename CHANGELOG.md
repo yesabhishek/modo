@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2 (2026-11-02)
+
+- Added Midnight and Black themes, plus optional, theme-aware project gradients across the app to distinguish workspaces. Each project can toggle its gradient independently.
+- Replaced the native About alert with a themed, keyboard-accessible dialog containing the app icon, version, publisher card, and clickable source and release links.
+- Redesigned Settings > About with a compact app header and separate Publisher, Updates, Resources, and startup-diagnostic controls.
+- Terminals support full-window mode and nested horizontal and vertical splits.
+- Removed the blue outline around terminal panes. Split dividers and the active terminal tab still show the layout and focus.
+- Review individual recent commits or a whole branch. Files can be marked reviewed, with progress remembered per project and reset when their diff changes.
+- The file tree honors .ignore and .gitignore, hides ignored entries by default, and can show them with muted labels. The hidden-files preference now works.
+- Tab menus support closing all tabs, all but one, and tabs to the left or right, with sequential unsaved-edit prompts and conflict-safe saves.
+- Open Folder is available on the empty project page. A compact, scrollable recent-folder picker shows folder names and abbreviated paths, with direct switching and a separate new-window button.
+- A To-dos sidebar finds TODO, FIXME, BUG, HACK, NOTE, and XXX source annotations, filters by tag, jumps to their source, and remembers completed tasks. Rows stay within the sidebar width, and language parsing excludes tags inside string literals and test fixtures.
+- Session file reads run off the UI thread, editors restore incrementally, and bounded startup diagnostics are saved in startup.log.
+- Packaged installs check for releases in the background at startup, verify SHA-256 checksums, and install updates. Windows waits until Modo exits; protected Linux installs use the system installer.
+- Publisher details now identify Abhishek Choudhury (www.abhishekchoudhury.com).
+
 ## 0.2.2 (2026-10-28)
 
 - **Faster terminal on Windows.** The installer now ships Windows Terminal's ConPTY (`conpty.dll` and `OpenConsole.exe`), which is quicker and more faithful than the console host built into Windows. PowerShell starts without its banner, and PowerShell 7 is preferred when installed. Drawing the terminal also does less work per frame on every platform.

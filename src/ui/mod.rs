@@ -1,8 +1,10 @@
 //! Modo's interface. Sizes are written in pixels at the 14px base and
 //! converted to rems, so the interface zoom setting scales everything.
+pub mod about;
 pub mod editor;
 pub mod palette;
 pub mod preview;
+pub mod project_gradient;
 pub mod review;
 pub mod settings_view;
 pub mod sidebar;

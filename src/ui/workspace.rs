@@ -10,7 +10,10 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme, IconName, TitleBar, WindowExt, h_flex, notification::Notification, v_flex,
+    ActiveTheme, IconName, TitleBar, WindowExt, h_flex,
+    menu::{ContextMenuExt, PopupMenuItem},
+    notification::Notification,
+    v_flex,
 };
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -43,6 +46,15 @@ actions!(
         ToggleSidebar,
         ToggleTerminal,
         NewTerminal,
+        MaximizeTerminal,
+        SplitTerminalHorizontal,
+        SplitTerminalVertical,
+        ShowTodos,
+        ToggleWindowColor,
+        CloseAllTabs,
+        CloseOtherTabs,
+        CloseTabsLeft,
+        CloseTabsRight,
         Save,
         SaveAll,
         CloseTab,
@@ -91,6 +103,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(k("cmd-j"), ToggleTerminal, Some(CONTEXT)),
         KeyBinding::new("ctrl-`", ToggleTerminal, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-`", NewTerminal, Some(CONTEXT)),
+        KeyBinding::new(k("cmd-shift-j"), MaximizeTerminal, Some(CONTEXT)),
         KeyBinding::new(k("cmd-s"), Save, Some(CONTEXT)),
         KeyBinding::new(k("cmd-alt-s"), SaveAll, Some(CONTEXT)),
         KeyBinding::new(k("cmd-w"), CloseTab, Some(CONTEXT)),
@@ -197,6 +210,7 @@ pub enum Panel {
     Files,
     Search,
     Changes,
+    Todos,
 }
 
 // A window holds a handful of tabs, so the size difference does not matter.
@@ -204,6 +218,40 @@ pub enum Panel {
 pub enum Tab {
     File(FileTab),
     Review,
+}
+
+#[derive(Clone, Copy)]
+pub enum TabClose {
+    All,
+    Others,
+    Left,
+    Right,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TabTarget {
+    File(PathBuf),
+    Review,
+}
+
+impl Tab {
+    fn target(&self) -> TabTarget {
+        match self {
+            Self::File(file) => TabTarget::File(file.path.clone()),
+            Self::Review => TabTarget::Review,
+        }
+    }
+}
+
+impl TabClose {
+    fn includes(self, ix: usize, anchor: Option<usize>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Others => anchor.is_some_and(|a| a != ix),
+            Self::Left => anchor.is_some_and(|a| ix < a),
+            Self::Right => anchor.is_some_and(|a| ix > a),
+        }
+    }
 }
 
 pub struct Project {
@@ -229,6 +277,7 @@ pub struct TreeRow {
     pub directory: bool,
     pub expanded: bool,
     pub hidden: bool,
+    pub ignored: bool,
 }
 
 #[derive(Default)]
@@ -260,6 +309,23 @@ pub struct Workspace {
     pub status: Option<SharedString>,
     /// Files the watcher saw change; reloaded on the next frame with a window.
     pending_reload: Option<HashSet<PathBuf>>,
+    pub todos: Vec<crate::todos::Todo>,
+    pub completed_todos: HashSet<String>,
+    pub todo_filter: Option<String>,
+    pub show_completed_todos: bool,
+    pub todo_loading: bool,
+    pub todo_loaded: bool,
+    pub todo_limited: bool,
+    pub todo_error: Option<SharedString>,
+    todo_task: Option<Task<()>>,
+    pub window_color: Option<bool>,
+    closing_tabs: bool,
+    project_generation: u64,
+    activation_generation: u64,
+    restore_task: Option<Task<()>>,
+    restoring_paths: Vec<PathBuf>,
+    restoring_active: Option<PathBuf>,
+    watcher_start: Option<Task<()>>,
     watcher: Option<Watcher>,
     _subscriptions: Vec<Subscription>,
     weak: WeakEntity<Self>,
@@ -282,6 +348,7 @@ impl Workspace {
             cx.subscribe_in(&review, window, Self::on_review_event),
             cx.subscribe_in(&search, window, Self::on_search_event),
             cx.observe_global::<Settings>(|this, cx| this.apply_settings(cx)),
+            cx.observe_global::<crate::updater::UpdateState>(|_, cx| cx.notify()),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -341,6 +408,23 @@ impl Workspace {
             settings: None,
             status: None,
             pending_reload: None,
+            todos: Vec::new(),
+            completed_todos: HashSet::new(),
+            todo_filter: None,
+            show_completed_todos: false,
+            todo_loading: false,
+            todo_loaded: false,
+            todo_limited: false,
+            todo_error: None,
+            todo_task: None,
+            window_color: None,
+            closing_tabs: false,
+            project_generation: 0,
+            activation_generation: 0,
+            restore_task: None,
+            restoring_paths: Vec::new(),
+            restoring_active: None,
+            watcher_start: None,
             watcher: None,
             _subscriptions: subscriptions,
             weak,
@@ -377,6 +461,10 @@ impl Workspace {
         if self.project.is_some() {
             self.remember_session(cx);
         }
+        self.project_generation += 1;
+        self.restore_task = None;
+        self.restoring_paths.clear();
+        self.restoring_active = None;
         let name: SharedString = root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -384,6 +472,16 @@ impl Workspace {
             .into();
         window.set_window_title(&name);
         let restored = Session::get_project(cx, &root);
+        self.todo_task = None;
+        self.todos.clear();
+        self.todo_loaded = false;
+        self.todo_loading = false;
+        self.todo_error = None;
+        self.completed_todos = restored
+            .as_ref()
+            .map(|s| s.completed_todos.clone())
+            .unwrap_or_default();
+        self.window_color = restored.as_ref().and_then(|s| s.window_color);
         self.tabs
             .retain(|tab| matches!(tab, Tab::File(file) if file.dirty));
         self.active = (!self.tabs.is_empty()).then_some(0);
@@ -401,7 +499,10 @@ impl Workspace {
                 self.sidebar_width = session.sidebar_width;
             }
         }
-        self.git = GitState::default();
+        self.git = GitState {
+            generation: self.git.generation + 1,
+            ..GitState::default()
+        };
         self.index = None;
         self.panel = Panel::Files;
         self.project = Some(Project {
@@ -426,14 +527,7 @@ impl Workspace {
         if let Some(session) = restored
             && Settings::get(cx).restore_session
         {
-            for file in session.open_files.iter().filter(|p| p.is_file()) {
-                self.open_file_quietly(file.clone(), window, cx);
-            }
-            if let Some(active) = session.active_file
-                && let Some(ix) = self.tab_for_path(&active)
-            {
-                self.activate(ix, window, cx);
-            }
+            self.restore_files(session.open_files, session.active_file, window, cx);
             if session.terminal_open {
                 self.terminal.update(cx, |t, cx| t.show(window, cx));
             }
@@ -448,17 +542,26 @@ impl Workspace {
 
     pub fn remember_session(&self, cx: &mut App) {
         let Some(project) = &self.project else { return };
+        let mut open_files: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::File(file) => Some(file.path.clone()),
+                Tab::Review => None,
+            })
+            .collect();
+        for path in &self.restoring_paths {
+            if !open_files.contains(path) {
+                open_files.push(path.clone());
+            }
+        }
         let session = ProjectSession {
             root: project.root.clone(),
-            open_files: self
-                .tabs
-                .iter()
-                .filter_map(|t| match t {
-                    Tab::File(f) => Some(f.path.clone()),
-                    Tab::Review => None,
-                })
-                .collect(),
-            active_file: self.active_file().map(|f| f.path.clone()),
+            open_files,
+            active_file: self
+                .restoring_active
+                .clone()
+                .or_else(|| self.active_file().map(|file| file.path.clone())),
             expanded: self
                 .tree
                 .expanded
@@ -469,6 +572,10 @@ impl Workspace {
             sidebar_width: self.sidebar_width,
             terminal_open: self.terminal.read(cx).open,
             review_base: self.review.read(cx).chosen_base(),
+            review_commit: self.review.read(cx).chosen_commit(),
+            reviewed_files: self.review.read(cx).reviewed_files(),
+            completed_todos: self.completed_todos.clone(),
+            window_color: self.window_color,
         };
         Session::remember(cx, session);
     }
@@ -482,13 +589,17 @@ impl Workspace {
         }
         self.review
             .update(cx, |review, cx| review.apply_settings(&settings, cx));
-        self.rebuild_rows();
+        if settings.watch_files != (self.watcher.is_some() || self.watcher_start.is_some()) {
+            self.start_watcher(cx);
+        }
+        self.rebuild_rows(cx);
         cx.notify();
     }
 
     // ---- Tree --------------------------------------------------------------
 
     pub fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let root = self.root().map(Path::to_path_buf);
         cx.spawn(async move |this, cx| {
             let read = {
                 let dir = dir.clone();
@@ -497,6 +608,9 @@ impl Workspace {
                     .await
             };
             this.update(cx, |this, cx| {
+                if this.root() != root.as_deref() {
+                    return;
+                }
                 match read {
                     Ok(entries) => {
                         this.tree.children.insert(dir, entries);
@@ -508,7 +622,7 @@ impl Workspace {
                         this.tree.expanded.remove(&dir);
                     }
                 }
-                this.rebuild_rows();
+                this.rebuild_rows(cx);
                 cx.notify();
             })
             .ok();
@@ -516,19 +630,29 @@ impl Workspace {
         .detach();
     }
 
-    pub fn rebuild_rows(&mut self) {
+    pub fn rebuild_rows(&mut self, cx: &App) {
         let Some(root) = self.root().map(Path::to_path_buf) else {
             self.tree.rows.clear();
             return;
         };
-        let show_hidden = true;
+        let settings = Settings::get(cx);
+        let show_hidden = settings.show_hidden_files;
+        let show_ignored = settings.show_ignored_files;
         let mut rows = Vec::with_capacity(self.tree.rows.len().max(64));
-        fn walk(tree: &Tree, dir: &Path, depth: usize, show_hidden: bool, rows: &mut Vec<TreeRow>) {
+        fn walk(
+            tree: &Tree,
+            dir: &Path,
+            depth: usize,
+            options: (bool, bool),
+            parent_ignored: bool,
+            rows: &mut Vec<TreeRow>,
+        ) {
             let Some(children) = tree.children.get(dir) else {
                 return;
             };
             for entry in children {
-                if !show_hidden && entry.is_hidden() {
+                let ignored = parent_ignored || entry.ignored;
+                if (!options.0 && entry.is_hidden()) || (!options.1 && ignored) {
                     continue;
                 }
                 let expanded = entry.directory && tree.expanded.contains(&entry.path);
@@ -539,13 +663,21 @@ impl Workspace {
                     directory: entry.directory,
                     expanded,
                     hidden: entry.is_hidden(),
+                    ignored,
                 });
                 if expanded {
-                    walk(tree, &entry.path, depth + 1, show_hidden, rows);
+                    walk(tree, &entry.path, depth + 1, options, ignored, rows);
                 }
             }
         }
-        walk(&self.tree, &root, 0, show_hidden, &mut rows);
+        walk(
+            &self.tree,
+            &root,
+            0,
+            (show_hidden, show_ignored),
+            false,
+            &mut rows,
+        );
         self.tree.rows = rows;
     }
 
@@ -557,14 +689,14 @@ impl Workspace {
             }
         }
         self.tree.selected = Some(path);
-        self.rebuild_rows();
+        self.rebuild_rows(cx);
         cx.notify();
     }
 
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
         if let Some(root) = self.root().map(Path::to_path_buf) {
             self.tree.expanded.retain(|p| p == &root);
-            self.rebuild_rows();
+            self.rebuild_rows(cx);
             cx.notify();
         }
     }
@@ -590,7 +722,7 @@ impl Workspace {
         }
         self.tree.selected = Some(path.to_path_buf());
         if missing.is_empty() {
-            self.rebuild_rows();
+            self.rebuild_rows(cx);
             if let Some(ix) = self.tree.rows.iter().position(|row| row.path == path) {
                 self.tree.scroll.scroll_to_item(ix, ScrollStrategy::Center);
             }
@@ -708,28 +840,51 @@ impl Workspace {
 
     fn start_watcher(&mut self, cx: &mut Context<Self>) {
         self.watcher = None;
+        self.watcher_start = None;
         let Some(root) = self.root().map(Path::to_path_buf) else {
             return;
         };
         if !Settings::get(cx).watch_files {
             return;
         }
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathBuf>();
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if let Ok(event) = event {
-                for path in event.paths {
-                    let _ = tx.unbounded_send(path);
+        let generation = self.project_generation;
+        let (tx, rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+        self.watcher_start = Some(cx.spawn(async move |this, cx| {
+            let watcher = cx
+                .background_executor()
+                .spawn(async move {
+                    use notify::Watcher as _;
+                    let mut watcher = notify::recommended_watcher(
+                        move |event: notify::Result<notify::Event>| {
+                            if let Ok(event) = event {
+                                for path in event.paths {
+                                    let _ = tx.unbounded_send(path);
+                                }
+                            }
+                        },
+                    )?;
+                    watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+                    crate::startup::log("file watcher ready".into());
+                    Ok::<_, notify::Error>(watcher)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.project_generation != generation || !Settings::get(cx).watch_files {
+                    return;
                 }
-            }
-        });
-        let Ok(mut watcher) = watcher else { return };
-        use notify::Watcher as _;
-        if watcher
-            .watch(&root, notify::RecursiveMode::Recursive)
-            .is_err()
-        {
-            return;
-        }
+                if let Ok(watcher) = watcher {
+                    this.watch_events(watcher, rx, cx);
+                }
+            });
+        }));
+    }
+
+    fn watch_events(
+        &mut self,
+        watcher: notify::RecommendedWatcher,
+        mut rx: futures::channel::mpsc::UnboundedReceiver<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             // Sleep until something changes, then gather the burst that follows.
@@ -800,6 +955,13 @@ impl Workspace {
                 created_or_removed = true;
             }
         }
+        if paths.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == ".ignore" || name == ".gitignore")
+        }) {
+            dirs.extend(self.tree.children.keys().cloned());
+            created_or_removed = true;
+        }
         for dir in dirs {
             self.load_dir(dir, cx);
         }
@@ -807,6 +969,9 @@ impl Workspace {
             self.refresh_git(cx);
         }
         if worktree_changed {
+            if self.todo_loaded || self.panel == Panel::Todos {
+                self.start_todos(cx);
+            }
             self.review.update(cx, |review, cx| review.mark_stale(cx));
             let changed: HashSet<PathBuf> = paths.into_iter().collect();
             self.pending_reload = Some(changed);
@@ -815,6 +980,64 @@ impl Workspace {
         if created_or_removed {
             self.start_index(cx);
         }
+    }
+
+    pub fn start_todos(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root().map(Path::to_path_buf) else {
+            return;
+        };
+        self.todo_loading = true;
+        self.todo_error = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.todo_task = Some(cx.spawn(async move |this, cx| {
+            let _cancel = CancelOnDrop(cancel.clone());
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let scan_root = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::todos::scan(&scan_root, &cancel) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.root() != Some(root.as_path()) {
+                    return;
+                }
+                this.todo_loading = false;
+                this.todo_loaded = true;
+                match result {
+                    Ok((todos, limited)) => {
+                        this.todos = todos;
+                        this.todo_limited = limited;
+                    }
+                    Err(error) => this.todo_error = Some(error.into()),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub fn toggle_todo(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.completed_todos.remove(key) {
+            self.completed_todos.insert(key.to_owned());
+        }
+        self.remember_session(cx);
+        cx.notify();
+    }
+
+    pub fn project_color(&self, cx: &App) -> Option<gpui_kit::Hsla> {
+        if !self.window_color.unwrap_or(Settings::get(cx).window_colors) {
+            return None;
+        }
+        let root = self.root()?;
+        let hash = blake3::hash(root.to_string_lossy().as_bytes());
+        Some(gpui_kit::hsla(
+            f32::from(hash.as_bytes()[0]) / 256.,
+            0.5,
+            if cx.theme().is_dark() { 0.6 } else { 0.4 },
+            1.,
+        ))
     }
 
     // ---- Tabs --------------------------------------------------------------
@@ -836,6 +1059,7 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
+        self.activation_generation += 1;
         self.active = Some(ix);
         match &self.tabs[ix] {
             Tab::File(file) => {
@@ -867,6 +1091,7 @@ impl Workspace {
             return;
         }
         let weak = self.weak.clone();
+        let generation = self.project_generation;
         cx.spawn_in(window, async move |_, cx| {
             let loaded = {
                 let path = path.clone();
@@ -876,37 +1101,206 @@ impl Workspace {
             };
             let _ = cx.update(|window, cx| {
                 let Some(this) = weak.upgrade() else { return };
-                this.update(cx, |this, cx| match loaded {
-                    Ok(file) => {
-                        if let Some(ix) = this.tab_for_path(&file.path) {
-                            this.activate(ix, window, cx);
-                            return;
-                        }
-                        let tab = FileTab::new(file, window, cx);
-                        if let Some(line) = line {
-                            tab.go_to_line(line, window, cx);
-                        }
-                        let ix = this
-                            .active
-                            .map_or(this.tabs.len(), |a| (a + 1).min(this.tabs.len()));
-                        this.tabs.insert(ix, Tab::File(tab));
-                        this.activate(ix, window, cx);
-                        this.remember_session(cx);
+                this.update(cx, |this, cx| {
+                    if this.project_generation != generation {
+                        return;
                     }
-                    Err(error) => this.notify_error(error, window, cx),
+                    match loaded {
+                        Ok(file) => {
+                            if let Some(ix) = this.tab_for_path(&file.path) {
+                                this.activate(ix, window, cx);
+                                return;
+                            }
+                            let tab = FileTab::new(file, window, cx);
+                            if let Some(line) = line {
+                                tab.go_to_line(line, window, cx);
+                            }
+                            let ix = this
+                                .active
+                                .map_or(this.tabs.len(), |a| (a + 1).min(this.tabs.len()));
+                            this.tabs.insert(ix, Tab::File(tab));
+                            this.activate(ix, window, cx);
+                            this.remember_session(cx);
+                        }
+                        Err(error) => this.notify_error(error, window, cx),
+                    }
                 });
             });
         })
         .detach();
     }
 
-    /// Restore a tab without stealing focus or reporting failures.
-    fn open_file_quietly(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(file) = crate::document::load(&path) {
-            let tab = FileTab::new(file, window, cx);
-            self.tabs.push(Tab::File(tab));
-            self.active = Some(self.tabs.len() - 1);
+    /// Read restored files off-thread, and mount one editor per frame so a
+    /// cold launch can paint and accept input before large sessions finish.
+    fn restore_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        active: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restoring_paths = paths.clone();
+        self.restoring_active = active.clone();
+        let generation = self.project_generation;
+        let mut expected_activation = self.activation_generation;
+        self.restore_task = Some(cx.spawn_in(window, async move |this, cx| {
+            for path in paths {
+                let restoring_path = path.clone();
+                let loaded = cx
+                    .background_executor()
+                    .spawn(async move { crate::document::load(&path) })
+                    .await;
+                let proceed = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.project_generation != generation {
+                            return false;
+                        }
+                        this.restoring_paths.retain(|path| path != &restoring_path);
+                        if let Ok(file) = loaded
+                            && this.tab_for_path(&file.path).is_none()
+                        {
+                            let preferred = active.as_ref() == Some(&file.path);
+                            let ix = this.tabs.len();
+                            let tab = FileTab::new(file, window, cx);
+                            this.tabs.push(Tab::File(tab));
+                            if this.activation_generation == expected_activation
+                                && (this.active.is_none() || preferred)
+                            {
+                                this.activate(ix, window, cx);
+                                expected_activation = this.activation_generation;
+                            }
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !proceed {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.project_generation == generation {
+                    this.restoring_paths.clear();
+                    this.restoring_active = None;
+                    this.remember_session(cx);
+                }
+            });
+        }));
+    }
+
+    pub fn close_tabs(
+        &mut self,
+        mode: TabClose,
+        anchor: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing_tabs {
+            return;
         }
+        if matches!(mode, TabClose::All) {
+            self.restore_task = None;
+            self.restoring_paths.clear();
+            self.restoring_active = None;
+        }
+        let targets: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| mode.includes(*ix, anchor))
+            .map(|(_, tab)| tab.target())
+            .collect();
+        self.closing_tabs = true;
+        cx.spawn_in(window, async move |this, cx| {
+            for target in targets {
+                let prompt = this.update_in(cx, |this, window, cx| {
+                    let ix = this.tabs.iter().position(|tab| tab.target() == target)?;
+                    if let Tab::File(file) = &this.tabs[ix]
+                        && file.dirty
+                    {
+                        return Some(window.prompt(
+                            PromptLevel::Warning,
+                            &format!("Save changes to {}?", file.name()),
+                            Some("Your changes will be lost if you don't save them."),
+                            &["Save", "Don't Save", "Cancel"],
+                            cx,
+                        ));
+                    }
+                    this.remove_tab(ix, window, cx);
+                    None
+                });
+                let Ok(prompt) = prompt else {
+                    break;
+                };
+                let Some(prompt) = prompt else {
+                    continue;
+                };
+                match prompt.await {
+                    Ok(0) => {
+                        let job = this
+                            .update(cx, |this, cx| {
+                                let ix = this.tabs.iter().position(|tab| tab.target() == target)?;
+                                match &mut this.tabs[ix] {
+                                    Tab::File(file) => file.begin_save(cx),
+                                    _ => None,
+                                }
+                            })
+                            .ok()
+                            .flatten();
+                        // A save already in flight must finish before this tab can close.
+                        let Some(job) = job else {
+                            break;
+                        };
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { job.run() })
+                            .await;
+                        let closed = this
+                            .update_in(cx, |this, window, cx| {
+                                let Some(ix) =
+                                    this.tabs.iter().position(|tab| tab.target() == target)
+                                else {
+                                    return true;
+                                };
+                                if let Tab::File(file) = &mut this.tabs[ix] {
+                                    if let Err(error) = file.finish_save(result, cx) {
+                                        this.notify_error(error, window, cx);
+                                        return false;
+                                    }
+                                    if file.dirty {
+                                        return false;
+                                    }
+                                }
+                                this.remove_tab(ix, window, cx);
+                                this.refresh_git(cx);
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !closed {
+                            break;
+                        }
+                    }
+                    Ok(1) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if let Some(ix) =
+                                this.tabs.iter().position(|tab| tab.target() == target)
+                            {
+                                this.remove_tab(ix, window, cx);
+                            }
+                        });
+                    }
+                    _ => break,
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.closing_tabs = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -973,9 +1367,6 @@ impl Workspace {
             return;
         };
         let Some(job) = file.begin_save(cx) else {
-            if close_after {
-                self.remove_tab(ix, window, cx);
-            }
             return;
         };
         let path = file.path.clone();
@@ -994,7 +1385,7 @@ impl Workspace {
                 match file.finish_save(result, cx) {
                     Ok(()) => {
                         this.status = Some(format!("Saved {}", file.name()).into());
-                        if close_after {
+                        if close_after && !file.dirty {
                             this.remove_tab(ix, window, cx);
                         }
                         this.refresh_git(cx);
@@ -1185,13 +1576,28 @@ impl Workspace {
     }
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| SettingsView::new(window, cx));
+        let gradient_enabled = if self.project.is_some() {
+            self.project_color(cx).is_some()
+        } else {
+            Settings::get(cx).window_colors
+        };
+        let view = cx.new(|cx| SettingsView::new(gradient_enabled, window, cx));
         self._subscriptions.push(cx.subscribe_in(
             &view,
             window,
-            |this, _, _: &super::settings_view::Close, window, cx| {
-                this.settings = None;
-                this.restore_focus(window, cx);
+            |this, _, event: &super::settings_view::SettingsEvent, window, cx| {
+                match event {
+                    super::settings_view::SettingsEvent::Close => {
+                        this.settings = None;
+                        this.restore_focus(window, cx);
+                    }
+                    super::settings_view::SettingsEvent::ProjectGradient(enabled) => {
+                        if this.project.is_some() {
+                            this.window_color = Some(*enabled);
+                            this.remember_session(cx);
+                        }
+                    }
+                }
                 cx.notify();
             },
         ));
@@ -1235,7 +1641,8 @@ impl Workspace {
             super::review::ReviewEvent::OpenFile(path, line) => {
                 self.open_file(path.clone(), *line, window, cx)
             }
-            super::review::ReviewEvent::BaseChanged => self.remember_session(cx),
+            super::review::ReviewEvent::BaseChanged
+            | super::review::ReviewEvent::ProgressChanged => self.remember_session(cx),
         }
     }
 
@@ -1267,7 +1674,11 @@ impl Workspace {
 
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let left_pad = if !self.sidebar_open && is_mac() && !window.is_fullscreen() {
+        let left_pad = if (!self.sidebar_open
+            || (self.terminal.read(cx).open && self.terminal.read(cx).maximized))
+            && is_mac()
+            && !window.is_fullscreen()
+        {
             r(78.)
         } else {
             r(8.)
@@ -1298,6 +1709,8 @@ impl Workspace {
                 ),
             };
             let hover = theme.list_hover;
+            let workspace = cx.entity().downgrade();
+            let target = tab.target();
             h_flex()
                 .id(("tab", ix))
                 .group("tab")
@@ -1362,6 +1775,29 @@ impl Workspace {
                             }
                         }),
                 )
+                .context_menu(move |menu, _, _| {
+                    let mut menu = menu;
+                    for (label, mode) in [
+                        ("Close all tabs", TabClose::All),
+                        ("Close all but this", TabClose::Others),
+                        ("Close tabs to the left", TabClose::Left),
+                        ("Close tabs to the right", TabClose::Right),
+                    ] {
+                        let workspace = workspace.clone();
+                        let target = target.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                let _ = workspace.update(cx, |this, cx| {
+                                    let anchor =
+                                        this.tabs.iter().position(|tab| tab.target() == target);
+                                    if anchor.is_some() {
+                                        this.close_tabs(mode, anchor, window, cx);
+                                    }
+                                });
+                            }));
+                    }
+                    menu
+                })
         });
         let terminal_open = self.terminal.read(cx).open;
         TitleBar::new()
@@ -1479,6 +1915,30 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
+            .when_some(
+                cx.try_global::<crate::updater::UpdateState>()
+                    .and_then(|state| state.message.clone()),
+                |bar, message| {
+                    let package = cx.global::<crate::updater::UpdateState>().package.clone();
+                    bar.child(
+                        div()
+                            .id("update-status")
+                            .max_w(r(420.))
+                            .truncate()
+                            .px(r(6.))
+                            .child(message.clone())
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(message.clone())
+                                    .build(window, cx)
+                            })
+                            .when_some(package, |item, package| {
+                                item.cursor_pointer().on_click(move |_, _, _| {
+                                    let _ = open::that(&package);
+                                })
+                            }),
+                    )
+                },
+            )
             .when_some(self.status.clone(), |bar, status| {
                 bar.child(div().px(r(6.)).child(status))
             })
@@ -1527,19 +1987,27 @@ impl Render for Workspace {
             {
                 eprintln!("modo: first frame after {:?}", started.elapsed());
             }
+            cx.background_executor()
+                .spawn(async {
+                    crate::startup::log("first frame".into());
+                })
+                .detach();
         });
         if let Some(paths) = self.pending_reload.take() {
             self.reload_clean_files(Some(&paths), window, cx);
         }
         let theme = cx.theme().clone();
-        let sidebar = self
-            .sidebar_open
+        let terminal_maximized = self.terminal.read(cx).open && self.terminal.read(cx).maximized;
+        let sidebar = (self.sidebar_open && !terminal_maximized)
             .then(|| super::sidebar::render(self, window, cx));
         let tab_bar = self.render_tab_bar(window, cx);
-        let content = self.render_content(window, cx);
+        let content = (!terminal_maximized).then(|| self.render_content(window, cx));
         let status = self.render_status_bar(cx);
         let terminal = self.terminal.clone();
         let terminal_open = terminal.read(cx).open;
+        let gradient = self.project_color(cx).map(|color| {
+            super::project_gradient::render(color, theme.is_dark()).into_any_element()
+        });
         let overlay = self
             .palette
             .clone()
@@ -1594,6 +2062,51 @@ impl Render for Workspace {
                     this.restore_focus(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &MaximizeTerminal, window, cx| {
+                this.terminal
+                    .update(cx, |t, cx| t.toggle_maximized(window, cx));
+            }))
+            .on_action(
+                cx.listener(|this, _: &SplitTerminalHorizontal, window, cx| {
+                    this.terminal.update(cx, |t, cx| {
+                        t.split(super::terminal::SplitAxis::Horizontal, window, cx)
+                    });
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SplitTerminalVertical, window, cx| {
+                this.terminal.update(cx, |t, cx| {
+                    t.split(super::terminal::SplitAxis::Vertical, window, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ShowTodos, _, cx| {
+                this.sidebar_open = true;
+                this.panel = Panel::Todos;
+                this.start_todos(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleWindowColor, _, cx| {
+                this.window_color =
+                    Some(!this.window_color.unwrap_or(Settings::get(cx).window_colors));
+                if let Some(settings) = &this.settings {
+                    let enabled = this.window_color.unwrap_or(false);
+                    settings.update(cx, |settings, cx| {
+                        settings.set_gradient_enabled(enabled, cx)
+                    });
+                }
+                this.remember_session(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
+                this.close_tabs(TabClose::All, this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
+                this.close_tabs(TabClose::Others, this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTabsLeft, window, cx| {
+                this.close_tabs(TabClose::Left, this.active, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTabsRight, window, cx| {
+                this.close_tabs(TabClose::Right, this.active, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                 this.terminal.update(cx, |t, cx| t.new_session(window, cx))
             }))
@@ -1610,10 +2123,10 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                if let Some(ix) = this.active {
-                    this.close_tab(ix, window, cx);
-                } else if this.terminal.read(cx).is_focused(window, cx) {
+                if this.terminal.read(cx).is_focused(window, cx) {
                     this.terminal.update(cx, |t, cx| t.close_active(window, cx));
+                } else if let Some(ix) = this.active {
+                    this.close_tab(ix, window, cx);
                 } else {
                     window.dispatch_action(Box::new(CloseWindow), cx);
                 }
@@ -1708,22 +2221,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, window, _| window.zoom_window()))
-            .on_action(cx.listener(|this, _: &About, window, cx| {
-                let _ = this;
-                let detail = format!(
-                    "Version {}\n{}",
-                    crate::brand::VERSION,
-                    crate::brand::TAGLINE
-                );
-                // The only button closes the dialog; no answer to wait for.
-                drop(window.prompt(
-                    PromptLevel::Info,
-                    crate::brand::NAME,
-                    Some(&detail),
-                    &["OK"],
-                    cx,
-                ));
-            }))
+            .on_action(cx.listener(|_, _: &About, window, cx| super::about::open(window, cx)))
             .when_some(sidebar, |root, sidebar| root.child(sidebar))
             .child(
                 v_flex()
@@ -1735,13 +2233,16 @@ impl Render for Workspace {
                         v_flex()
                             .flex_1()
                             .min_h_0()
-                            .child(div().flex_1().min_h_0().child(content))
+                            .when_some(content, |col, content| {
+                                col.child(div().flex_1().min_h_0().child(content))
+                            })
                             .when(terminal_open, |col| col.child(terminal)),
                     )
                     .when(self.project.is_some() || !self.tabs.is_empty(), |col| {
                         col.child(status)
                     }),
             )
+            .when_some(gradient, |root, gradient| root.child(gradient))
             .when_some(overlay, |root, overlay| {
                 root.child(
                     deferred(

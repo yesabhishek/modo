@@ -18,8 +18,12 @@ Agents like Claude Code, Codex, and Cursor write most of the code now. What you 
 - **Read and edit code.** Tree-sitter highlighting for over 25 languages, find and replace, multiple cursors, safe saves that never overwrite changes made on disk.
 - **Follow along live.** Files, the tree, and the review refresh on their own while an agent edits.
 - **Find anything.** Fuzzy file search, project-wide search on ripgrep's engine, and a command palette.
-- **Run commands.** A real terminal with tabs, true color, and the shell you choose: zsh, bash, fish, PowerShell, Command Prompt, Git Bash, WSL, or your own command.
-- **Look calm.** Light, Dark, Paper, and Graphite themes, inspired by Notion.
+- **Run commands.** A real terminal with tabs, nested horizontal and vertical splits, a full-window mode, true color, and the shell you choose: zsh, bash, fish, PowerShell, Command Prompt, Git Bash, WSL, or your own command.
+- **Look calm.** Light, Dark, Paper, Graphite, Midnight, and Black themes, with optional project gradients across the app to distinguish workspaces.
+
+- **Track your review.** Select an individual commit or compare a branch, then mark each changed file reviewed from its diff header or the sidebar. Checkmarks survive restarts and clear when the diff changes.
+- **Track source tasks.** The To-dos sidebar finds TODO, FIXME, BUG, HACK, NOTE, and XXX comments. Filter by tag, jump to a source line, or mark tasks completed.
+- **Keep projects tidy.** Ignored files are hidden by default; Settings > Appearance can show them greyed out. Right-click a tab for bulk closing options. Click the folder name for recent folders and new-window options.
 
 ## Install
 
@@ -37,6 +41,10 @@ Download a build from the [Releases page](https://github.com/yesabhishek/modo/re
 ```bash
 xattr -dr com.apple.quarantine /Applications/Modo.app
 ```
+
+### Updates
+
+Packaged installations check for a newer stable release in the background at startup and verify the download against its SHA-256 checksum. On macOS, updates replace the app bundle and take effect next launch; the previous bundle is restored if replacement fails. Windows waits until all Modo processes using the installation have exited, then runs the installer. Writable Linux installations replace the binary; protected system installations download a package and expose an install action in the status bar. Settings > About can disable automatic updates. Source builds and temporary sessions do not update themselves.
 
 ### From source
 
@@ -77,6 +85,7 @@ Then review what your agent did:
 | Review changes | `⌘⇧G` | `Ctrl+Shift+G` |
 | Markdown preview | `⌘⇧V` | `Ctrl+Shift+V` |
 | Terminal | `⌘J` | `Ctrl+J` |
+| Full-window terminal | `⌘⇧J` | `Ctrl+Shift+J` |
 | Settings | `⌘,` | `Ctrl+,` |
 
 In the palette, type `>` for commands, `:` for a line number, and `@` to switch projects.
@@ -97,7 +106,11 @@ cargo test                     # unit and Git integration tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-Modo is about 9,500 lines of Rust on [GPUI](https://gpui.rs), the GPU renderer behind Zed, with components from GPUI Kit. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together, [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for measurements, and [docs/RELEASING.md](docs/RELEASING.md) for packaging. Contributions are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md).
+Modo is a native Rust application on [GPUI](https://gpui.rs), the GPU renderer behind Zed, with components from GPUI Kit. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it fits together, [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for measurements, and [docs/RELEASING.md](docs/RELEASING.md) for packaging. Contributions are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Publisher
+
+[Abhishek Choudhury](https://www.abhishekchoudhury.com).
 
 ## License
 

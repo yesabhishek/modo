@@ -12,15 +12,18 @@ use std::{
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt as _, h_flex,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt as _,
+    button::{Button, ButtonVariants},
+    h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     spinner::Spinner,
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Empty, Entity, EventEmitter, FontWeight,
-    Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, Task, TextRun,
+    AnyElement, App, AppContext, Context, DismissEvent, DragMoveEvent, Empty, Entity, EventEmitter,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription, Task, TextRun,
     UniformListScrollHandle, Window, div, prelude::FluentBuilder, uniform_list,
 };
 
@@ -28,13 +31,25 @@ use super::{
     NavRow, drag_region, icon_button, is_mac, kbd, r, section_label, shortcut,
     workspace::{
         FindInFiles, OpenFolder, OpenSettings, Panel, QuickOpen, RefreshProject, ReviewChanges,
-        ShowFiles, SwitchProject, ToggleSidebar, Workspace,
+        ShowFiles, ShowTodos, ToggleSidebar, ToggleWindowColor, Workspace,
     },
 };
 use crate::{
     files,
     search::{self, Query, Results},
 };
+
+fn compact_project_path(path: &Path) -> SharedString {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(relative) => format!("~/{}", relative.display()).into(),
+        None => path.display().to_string().into(),
+    }
+}
 
 /// Marker carried while the sidebar edge is dragged.
 #[derive(Clone)]
@@ -121,57 +136,179 @@ pub fn render(
         );
 
     let project_row = {
-        let (letter, name) = match &this.project {
-            Some(project) => (
-                project
-                    .name
-                    .chars()
-                    .next()
-                    .unwrap_or('M')
-                    .to_uppercase()
-                    .to_string(),
-                project.name.clone(),
-            ),
-            None => ("M".to_owned(), SharedString::from(crate::brand::NAME)),
-        };
-        let hover = theme.list_hover;
-        h_flex()
-            .id("project-switcher")
-            .h(r(32.))
-            .mx(r(6.))
-            .px(r(6.))
-            .gap(r(8.))
-            .rounded(r(6.))
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(SwitchProject), cx))
+        let name = this
+            .project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| crate::brand::NAME.into());
+        let letter = name
+            .chars()
+            .next()
+            .unwrap_or('M')
+            .to_uppercase()
+            .to_string();
+        let workspace = cx.entity().downgrade();
+        Button::new("project-switcher")
+            .ghost()
+            .w_full()
+            .h(r(34.))
+            .px(r(12.))
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(r(22.))
-                    .rounded(r(5.))
-                    .bg(theme.foreground)
-                    .text_color(theme.background)
-                    .text_size(r(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(letter),
+                h_flex()
+                    .w_full()
+                    .gap(r(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(r(22.))
+                            .rounded(r(5.))
+                            .bg(this.project_color(cx).unwrap_or(theme.foreground))
+                            .text_color(theme.background)
+                            .text_size(r(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(letter),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(r(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        Icon::new(Lucide::ChevronsUpDown)
+                            .size(r(14.))
+                            .text_color(theme.muted_foreground),
+                    ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text_size(r(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(name),
-            )
-            .child(
-                Icon::new(Lucide::ChevronsUpDown)
-                    .size(r(14.))
-                    .text_color(theme.muted_foreground),
-            )
+            .dropdown_menu(move |menu, window, cx| {
+                let recent = crate::settings::Session::get(cx).recent.clone();
+                let current = workspace
+                    .upgrade()
+                    .and_then(|workspace| workspace.read(cx).root().map(Path::to_path_buf));
+                let color_on = workspace
+                    .upgrade()
+                    .is_some_and(|workspace| workspace.read(cx).project_color(cx).is_some());
+                let menu_entity = cx.entity().downgrade();
+                let width =
+                    gpui_kit::px(360.).min(window.viewport_size().width - gpui_kit::px(24.));
+                let height =
+                    gpui_kit::px(440.).min(window.viewport_size().height - gpui_kit::px(96.));
+                let mut menu = menu
+                    .min_w(width)
+                    .max_w(width)
+                    .max_h(height)
+                    .scrollable(true)
+                    .item(
+                        PopupMenuItem::new("Open folder…")
+                            .icon(Lucide::FolderOpen)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenFolder), cx)
+                            }),
+                    )
+                    .separator()
+                    .label("Recent folders");
+                for (ix, path) in recent.into_iter().filter(|path| path.is_dir()).enumerate() {
+                    let selected = current.as_ref() == Some(&path);
+                    let name: SharedString = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                        .into();
+                    let display_path = compact_project_path(&path);
+                    let open_path = path.clone();
+                    let new_path = path.clone();
+                    let menu_entity = menu_entity.clone();
+                    let workspace = workspace.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let menu_entity = menu_entity.clone();
+                            let new_path = new_path.clone();
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .max_w(width - gpui_kit::px(24.))
+                                .py(r(5.))
+                                .gap(r(8.))
+                                .child(
+                                    Icon::new(if selected {
+                                        Lucide::Check
+                                    } else {
+                                        Lucide::FolderGit2
+                                    })
+                                    .size(r(15.))
+                                    .flex_none()
+                                    .text_color(if selected {
+                                        cx.theme().primary
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    }),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(r(2.))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(r(13.))
+                                                .font_medium()
+                                                .child(name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(r(11.5))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(display_path.clone()),
+                                        ),
+                                )
+                                .child(
+                                    icon_button(
+                                        ("recent-new-window", ix),
+                                        Lucide::ExternalLink,
+                                        cx,
+                                    )
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Open in new window",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = menu_entity
+                                                .update(cx, |_, cx| cx.emit(DismissEvent));
+                                            crate::open_window(Some(new_path.clone()), cx);
+                                        },
+                                    ),
+                                )
+                        })
+                        .on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                if this.root() != Some(open_path.as_path()) {
+                                    this.open_path(open_path.clone(), window, cx);
+                                }
+                            });
+                        }),
+                    );
+                }
+                menu.separator().item(
+                    PopupMenuItem::new("Project gradient")
+                        .icon(Lucide::Paintbrush)
+                        .checked(color_on)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleWindowColor), cx)
+                        }),
+                )
+            })
     };
 
     let nav = v_flex()
@@ -224,6 +361,12 @@ pub fn render(
                 })),
         )
         .child(
+            NavRow::new("nav-todos", "To-dos")
+                .icon(Lucide::ListTodo)
+                .selected(panel == Panel::Todos)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTodos), cx)),
+        )
+        .child(
             NavRow::new("nav-settings", "Settings")
                 .icon(IconName::Settings)
                 .trailing(kbd(shortcut("⌘,", "Ctrl+,"), cx))
@@ -256,6 +399,7 @@ pub fn render(
                 .child(div().flex_1().min_h_0().child(this.search.clone()))
                 .into_any_element(),
             Panel::Changes => render_changes(this, cx),
+            Panel::Todos => render_todos(this, cx),
         }
     };
 
@@ -391,6 +535,7 @@ fn render_tree_row(
     let dir_dirty = row.directory && this.git.dirty_dirs.contains(&row.path);
     let hover = theme.list_hover;
     let name_color = match badge {
+        _ if row.ignored => theme.muted_foreground,
         Some(b) => status_color(b, cx),
         None if row.hidden => theme.muted_foreground,
         None => theme.sidebar_foreground,
@@ -419,6 +564,7 @@ fn render_tree_row(
         .rounded(r(5.))
         .text_size(r(13.5))
         .text_color(name_color)
+        .when(row.ignored, |row| row.opacity(0.55))
         .cursor_pointer()
         .when(selected, |r| {
             r.bg(theme.list_active).text_color(theme.foreground)
@@ -583,6 +729,7 @@ fn render_change_row(
     let theme = cx.theme().clone();
     let hover = theme.list_hover;
     let path = file.path.clone();
+    let review_path = path.clone();
     let name = Path::new(path.as_ref())
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -609,6 +756,24 @@ fn render_change_row(
         .text_size(r(13.))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
+        .child(
+            icon_button(
+                SharedString::from(format!("review-check-{ix}")),
+                if file.reviewed {
+                    Lucide::Check
+                } else {
+                    Lucide::Square
+                },
+                cx,
+            )
+            .when(file.reviewed, |button| button.text_color(theme.green))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.review
+                    .update(cx, |review, cx| review.toggle_reviewed(&review_path, cx));
+            })),
+        )
+        .when(file.reviewed, |row| row.opacity(0.65))
         .child(file_icon(Path::new(path.as_ref()), cx).flex_none())
         .child(
             // The folder only takes space the name leaves; a long name truncates
@@ -657,6 +822,144 @@ fn render_change_row(
                 .update(cx, |review, cx| review.scroll_to_file(&path, cx));
         }));
     div().w_full().px(r(6.)).child(row).into_any_element()
+}
+
+fn render_todos(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let completed = this
+        .todos
+        .iter()
+        .filter(|todo| this.completed_todos.contains(&todo.key))
+        .count();
+    let rows: Vec<_> = this
+        .todos
+        .iter()
+        .enumerate()
+        .filter(|(_, todo)| {
+            (this.show_completed_todos || !this.completed_todos.contains(&todo.key))
+                && this.todo_filter.as_ref().is_none_or(|tag| tag == &todo.tag)
+        })
+        .map(|(ix, _)| ix)
+        .collect();
+    let count = rows.len();
+    let workspace = cx.entity().downgrade();
+    v_flex().size_full()
+        .child(panel_header("To-dos", [icon_button("todos-refresh", IconName::RefreshCw, cx)
+            .on_click(cx.listener(|this, _, _, cx| this.start_todos(cx))).into_any_element(), close_panel(cx)], cx))
+        .child(h_flex().px(r(10.)).py(r(6.)).gap(r(4.))
+            .child(Button::new("todo-filter").ghost().xsmall().label(this.todo_filter.clone().unwrap_or_else(|| "All tags".into())).dropdown_caret(true)
+                .dropdown_menu(move |menu, _, _| {
+                    let mut menu = menu;
+                    for tag in std::iter::once(None).chain(crate::todos::TAGS.iter().map(|tag| Some((*tag).to_owned()))) {
+                        let workspace = workspace.clone();
+                        menu = menu.item(PopupMenuItem::new(tag.clone().unwrap_or_else(|| "All tags".into())).on_click(move |_, _, cx| {
+                            let _ = workspace.update(cx, |this, cx| { this.todo_filter = tag.clone(); cx.notify(); });
+                        }));
+                    }
+                    menu
+                }))
+            .child(div().flex_1())
+            .when(this.todo_loading, |row| row.child(Spinner::new().xsmall()))
+            .child(icon_button("todos-completed", Lucide::Check, cx)
+                .when(this.show_completed_todos, |button| button.bg(theme.list_active))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Show or hide completed tasks").build(window, cx))
+                .on_click(cx.listener(|this, _, _, cx| { this.show_completed_todos = !this.show_completed_todos; cx.notify(); }))))
+        .child(div().px(r(14.)).pb(r(8.)).text_size(r(12.)).text_color(theme.muted_foreground)
+            .child(format!("{} open · {completed} completed{}", this.todos.len() - completed, if this.todo_limited { " · results limited" } else { "" })))
+        .when_some(this.todo_error.clone(), |col, error| col.child(div().px(r(14.)).text_color(theme.red).child(error)))
+        .when(count == 0 && !this.todo_loading, |col| col.child(div().px(r(14.)).py(r(12.)).text_size(r(13.)).text_color(theme.muted_foreground)
+            .child("No matching tasks. Source comments tagged TODO, FIXME, BUG, HACK, NOTE or XXX appear here.")))
+        .child(uniform_list("todo-list", count, cx.processor(move |this: &mut Workspace, range: Range<usize>, _, cx| {
+            range.filter_map(|row| rows.get(row).and_then(|ix| this.todos.get(*ix)).cloned())
+                .map(|todo| render_todo_row(this, todo, cx)).collect::<Vec<_>>()
+        })).w_full().min_w_0().overflow_x_hidden().flex_1()).into_any_element()
+}
+
+fn render_todo_row(
+    this: &Workspace,
+    todo: crate::todos::Todo,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    let checked = this.completed_todos.contains(&todo.key);
+    let key = todo.key.clone();
+    let hover = theme.list_hover;
+    let detail: SharedString = todo.text.clone().into();
+    let row = h_flex()
+        .w_full()
+        .id(SharedString::from(format!("todo-{}", todo.key)))
+        .px(r(6.))
+        .h(r(64.))
+        .gap(r(6.))
+        .rounded(r(6.))
+        .min_w_0()
+        .overflow_hidden()
+        .cursor_pointer()
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+        })
+        .hover(move |s| s.bg(hover))
+        .when(checked, |row| row.opacity(0.55))
+        .child(
+            icon_button(
+                SharedString::from(format!("todo-check-{}", todo.key)),
+                if checked {
+                    Lucide::Check
+                } else {
+                    Lucide::Circle
+                },
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_todo(&key, cx);
+            })),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(r(3.))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap(r(6.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(r(10.))
+                                .font_medium()
+                                .text_color(theme.primary)
+                                .child(todo.tag),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().text_size(r(13.)).child(
+                            if todo.text.is_empty() {
+                                "Untitled task".to_owned()
+                            } else {
+                                todo.text
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(r(11.5))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{}:{}", todo.relative, todo.line)),
+                ),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_file(todo.path.clone(), Some(todo.line), window, cx)
+        }))
+        .into_any_element();
+    div()
+        .w_full()
+        .min_w_0()
+        .px(r(6.))
+        .overflow_hidden()
+        .child(row)
+        .into_any_element()
 }
 
 /// Return the sidebar to the file tree.

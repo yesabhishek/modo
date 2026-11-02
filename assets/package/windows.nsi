@@ -14,6 +14,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 VIProductVersion "${NUMERIC_VERSION}.0"
 VIAddVersionKey "ProductName" "Modo"
+VIAddVersionKey "CompanyName" "Abhishek Choudhury"
 VIAddVersionKey "FileDescription" "Modo installer"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}"
@@ -62,7 +63,8 @@ Section "Install"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "Modo"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\modo.ico"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "Modo"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "Abhishek Choudhury"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "URLInfoAbout" "https://www.abhishekchoudhury.com"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'

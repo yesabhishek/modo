@@ -16,15 +16,19 @@ pub enum ThemeChoice {
     Dark,
     Paper,
     Graphite,
+    Midnight,
+    Black,
 }
 
 impl ThemeChoice {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::System,
         Self::Light,
         Self::Dark,
         Self::Paper,
         Self::Graphite,
+        Self::Midnight,
+        Self::Black,
     ];
 
     pub fn label(self) -> &'static str {
@@ -34,6 +38,8 @@ impl ThemeChoice {
             Self::Dark => "Dark",
             Self::Paper => "Paper",
             Self::Graphite => "Graphite",
+            Self::Midnight => "Midnight",
+            Self::Black => "Black",
         }
     }
 }
@@ -75,6 +81,9 @@ pub struct Settings {
     pub review_layout: ReviewLayout,
     pub review_base: ReviewBase,
     pub show_hidden_files: bool,
+    pub show_ignored_files: bool,
+    pub window_colors: bool,
+    pub auto_update: bool,
     pub restore_session: bool,
     pub watch_files: bool,
 }
@@ -97,6 +106,9 @@ impl Default for Settings {
             review_layout: ReviewLayout::Unified,
             review_base: ReviewBase::Branch,
             show_hidden_files: true,
+            show_ignored_files: false,
+            window_colors: false,
+            auto_update: true,
             restore_session: true,
             watch_files: true,
         }
@@ -148,6 +160,10 @@ pub struct ProjectSession {
     pub terminal_open: bool,
     /// The branch the user chose to review against, when not the detected one.
     pub review_base: Option<String>,
+    pub review_commit: Option<String>,
+    pub reviewed_files: std::collections::HashMap<String, String>,
+    pub completed_todos: std::collections::HashSet<String>,
+    pub window_color: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -228,6 +244,22 @@ fn store_json<T: Serialize>(name: &'static str, value: &T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_sessions_gain_progress_defaults_without_losing_tabs() {
+        let session: ProjectSession = serde_json::from_str(
+            r#"{"root":"/project","open_files":["/project/main.rs"],"review_base":"main"}"#,
+        )
+        .unwrap();
+        assert_eq!(session.open_files, vec![PathBuf::from("/project/main.rs")]);
+        assert_eq!(session.review_base.as_deref(), Some("main"));
+        assert!(session.reviewed_files.is_empty());
+        assert!(session.completed_todos.is_empty());
+        assert_eq!(session.window_color, None);
+        let restored: ProjectSession =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(session, restored);
+    }
 
     #[test]
     fn unknown_or_partial_settings_fall_back_to_defaults() {

@@ -24,3 +24,7 @@ footprint $(pgrep -n modo)                               # macOS memory
 ```
 
 Idle CPU should stay at zero: Modo only redraws on input, file changes, or terminal output.
+
+## Startup diagnostics
+
+Each normal launch writes its first-frame time to `startup.log` in Modo's configuration directory. The log rotates at 64 KiB, retaining `startup.previous.log`; temporary sessions do not write it. Saved files load on background threads and editors mount incrementally, so session restoration does not block the first frame on disk reads. Update checks start after the first frame and run in the background.

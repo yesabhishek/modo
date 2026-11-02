@@ -1,10 +1,11 @@
 [package]
 name = "modo"
-version = "0.2.2"
+version = "0.3.2"
 edition = "2024"
 description = "A calm, fast, native workspace for reading, reviewing, and editing code an agent wrote."
 repository = "https://github.com/yesabhishek/modo"
-homepage = "https://github.com/yesabhishek/modo"
+homepage = "https://www.abhishekchoudhury.com"
+authors = ["Abhishek Choudhury"]
 readme = "README.md"
 keywords = ["editor", "code-review", "terminal", "native", "desktop"]
 categories = ["text-editors", "development-tools"]
@@ -66,6 +67,8 @@ nucleo-matcher = "0.3"
 open = "5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+semver = "1.0"
+sha2 = "0.10"
 tempfile = "3.20"
 
 [dev-dependencies]

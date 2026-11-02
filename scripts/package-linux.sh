@@ -35,11 +35,11 @@ Version: $version
 Section: devel
 Priority: optional
 Architecture: $arch
-Maintainer: Modo <https://github.com/yesabhishek/modo>
+Maintainer: Abhishek Choudhury
 Installed-Size: $(du -sk "$deb/usr" | cut -f1)
 Depends: libc6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-xcb1, libxcb1, libfontconfig1, libfreetype6, libvulkan1, git
 Recommends: mesa-vulkan-drivers
-Homepage: https://github.com/yesabhishek/modo
+Homepage: https://www.abhishekchoudhury.com
 Description: Read, review, and edit what your agents wrote
  Modo is a fast native desktop app for reviewing the code coding agents
  write: branch diffs, a code editor, project search, and a terminal.

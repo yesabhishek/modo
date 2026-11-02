@@ -50,6 +50,8 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
         ThemeChoice::Dark => ("Modo Light", "Modo Dark", ThemeMode::Dark),
         ThemeChoice::Paper => ("Modo Paper", "Modo Dark", ThemeMode::Light),
         ThemeChoice::Graphite => ("Modo Light", "Modo Graphite", ThemeMode::Dark),
+        ThemeChoice::Midnight => ("Modo Light", "Modo Midnight", ThemeMode::Dark),
+        ThemeChoice::Black => ("Modo Light", "Modo Black", ThemeMode::Dark),
     };
     let (Some(light), Some(dark)) = (config(light, cx), config(dark, cx)) else {
         return;
