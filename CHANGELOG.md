@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 (2026-11-05)
+
+- JSON opens in a native expandable tree; CSV and TSV open in native tables with a header toggle, cell copying, and column pages for wide files. Source editing stays one click away.
+- Search structured views with Cmd+F / Ctrl+F. JSON search includes collapsed descendants and decoded string values; CSV search scans every column. Rows are virtualized, parsing and filtering run off the UI thread, and stale searches are cancelled.
+- Format JSON and CSV/TSV with the Format button, command palette, or Alt+Shift+F. Formatting is undoable, preserves JSON key order, duplicate keys, and exact number text, and retains CSV cell content and quoting semantics. Malformed data is reported without modification. CSV saves preserve significant trailing spaces even when whitespace trimming is enabled.
+- Structured parsing is bounded to 10 MiB and 250,000 values, with depth limits, source fallback, and no new runtime dependencies.
+
+- Create files from the Files sidebar toolbar or a folder's right-click menu. Enter a file name and press Enter or Create; the new file opens immediately. Existing files are never overwritten, and creation errors stay beside the input.
+- Auto save is enabled by default and saves edited files after a short pause in typing, including background tabs. Settings > Editor can turn it off; manual Save and Save All remain available.
+- Automatic saves use the existing conflict-safe atomic save path, preserve edits made during a save, and stop retrying failed revisions until another edit or manual save.
+
 ## 0.3.2 (2026-11-02)
 
 - Added Midnight and Black themes, plus optional, theme-aware project gradients across the app to distinguish workspaces. Each project can toggle its gradient independently.

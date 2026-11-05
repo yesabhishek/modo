@@ -11,6 +11,7 @@ use std::{
 
 use gpui_kit::component::{
     ActiveTheme, IconName, TitleBar, WindowExt, h_flex,
+    input::{InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
     notification::Notification,
     v_flex,
@@ -57,6 +58,7 @@ actions!(
         CloseTabsRight,
         Save,
         SaveAll,
+        FormatDocument,
         CloseTab,
         NextTab,
         PreviousTab,
@@ -88,6 +90,7 @@ actions!(
 const CONTEXT: &str = "Workspace";
 
 pub fn init(cx: &mut App) {
+    super::data_view::init(cx);
     let cmd = if is_mac() { "cmd" } else { "ctrl" };
     // Bindings live for the whole process, so leaking the few strings is fine.
     let k = |keys: &str| -> &'static str { Box::leak(keys.replace("cmd", cmd).into_boxed_str()) };
@@ -105,6 +108,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-`", NewTerminal, Some(CONTEXT)),
         KeyBinding::new(k("cmd-shift-j"), MaximizeTerminal, Some(CONTEXT)),
         KeyBinding::new(k("cmd-s"), Save, Some(CONTEXT)),
+        KeyBinding::new("alt-shift-f", FormatDocument, Some(CONTEXT)),
         KeyBinding::new(k("cmd-alt-s"), SaveAll, Some(CONTEXT)),
         KeyBinding::new(k("cmd-w"), CloseTab, Some(CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
@@ -121,6 +125,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(k("cmd--"), ZoomOut, None),
         KeyBinding::new(k("cmd-0"), ZoomReset, None),
         KeyBinding::new("escape", Dismiss, Some("Overlay")),
+        KeyBinding::new("escape", Dismiss, Some("NewFile")),
     ]);
     if is_mac() {
         // The editor binds ⌘⇧F to in-file replace; project search wins, like
@@ -307,6 +312,7 @@ pub struct Workspace {
     pub palette: Option<Entity<Palette>>,
     pub settings: Option<Entity<SettingsView>>,
     pub status: Option<SharedString>,
+    pub new_file: Option<NewFile>,
     /// Files the watcher saw change; reloaded on the next frame with a window.
     pending_reload: Option<HashSet<PathBuf>>,
     pub todos: Vec<crate::todos::Todo>,
@@ -320,6 +326,7 @@ pub struct Workspace {
     todo_task: Option<Task<()>>,
     pub window_color: Option<bool>,
     closing_tabs: bool,
+    save_prompts: usize,
     project_generation: u64,
     activation_generation: u64,
     restore_task: Option<Task<()>>,
@@ -329,6 +336,14 @@ pub struct Workspace {
     watcher: Option<Watcher>,
     _subscriptions: Vec<Subscription>,
     weak: WeakEntity<Self>,
+}
+
+pub struct NewFile {
+    pub parent: PathBuf,
+    pub input: Entity<InputState>,
+    pub error: Option<SharedString>,
+    pub creating: bool,
+    _subscription: Subscription,
 }
 
 struct Watcher {
@@ -347,7 +362,12 @@ impl Workspace {
             }),
             cx.subscribe_in(&review, window, Self::on_review_event),
             cx.subscribe_in(&search, window, Self::on_search_event),
-            cx.observe_global::<Settings>(|this, cx| this.apply_settings(cx)),
+            cx.observe_global_in::<Settings>(window, |this, window, cx| {
+                this.apply_settings(cx);
+                for ix in 0..this.tabs.len() {
+                    this.schedule_auto_save(ix, window, cx);
+                }
+            }),
             cx.observe_global::<crate::updater::UpdateState>(|_, cx| cx.notify()),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -407,6 +427,7 @@ impl Workspace {
             palette: None,
             settings: None,
             status: None,
+            new_file: None,
             pending_reload: None,
             todos: Vec::new(),
             completed_todos: HashSet::new(),
@@ -419,6 +440,7 @@ impl Workspace {
             todo_task: None,
             window_color: None,
             closing_tabs: false,
+            save_prompts: 0,
             project_generation: 0,
             activation_generation: 0,
             restore_task: None,
@@ -462,6 +484,7 @@ impl Workspace {
             self.remember_session(cx);
         }
         self.project_generation += 1;
+        self.new_file = None;
         self.restore_task = None;
         self.restoring_paths.clear();
         self.restoring_active = None;
@@ -1085,7 +1108,7 @@ impl Workspace {
         let path = dunce::canonicalize(&path).unwrap_or(path);
         if let Some(ix) = self.tab_for_path(&path) {
             self.activate(ix, window, cx);
-            if let (Some(line), Some(Tab::File(file))) = (line, self.tabs.get(ix)) {
+            if let (Some(line), Some(Tab::File(file))) = (line, self.tabs.get_mut(ix)) {
                 file.go_to_line(line, window, cx);
             }
             return;
@@ -1111,7 +1134,7 @@ impl Workspace {
                                 this.activate(ix, window, cx);
                                 return;
                             }
-                            let tab = FileTab::new(file, window, cx);
+                            let mut tab = FileTab::new(file, window, cx);
                             if let Some(line) = line {
                                 tab.go_to_line(line, window, cx);
                             }
@@ -1309,6 +1332,7 @@ impl Workspace {
             && file.dirty
         {
             let name = file.name();
+            self.save_prompts += 1;
             let answer = window.prompt(
                 PromptLevel::Warning,
                 &format!("Save changes to {name}?"),
@@ -1318,14 +1342,15 @@ impl Workspace {
             );
             let path = file.path.clone();
             cx.spawn_in(window, async move |this, cx| {
-                let Ok(answer) = answer.await else { return };
+                let answer = answer.await.ok();
                 let _ = this.update_in(cx, |this, window, cx| {
+                    this.save_prompts = this.save_prompts.saturating_sub(1);
                     let Some(ix) = this.tab_for_path(&path) else {
                         return;
                     };
                     match answer {
-                        0 => this.save_tab(ix, true, window, cx),
-                        1 => this.remove_tab(ix, window, cx),
+                        Some(0) => this.save_tab(ix, true, window, cx),
+                        Some(1) => this.remove_tab(ix, window, cx),
                         _ => {}
                     }
                 });
@@ -1356,10 +1381,179 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn start_new_file(&mut self, parent: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_file.as_ref().is_some_and(|draft| draft.creating) {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("File name"));
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.create_file(window, cx);
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.new_file = Some(NewFile {
+            parent,
+            input,
+            error: None,
+            creating: false,
+            _subscription: subscription,
+        });
+        self.panel = Panel::Files;
+        self.sidebar_open = true;
+        cx.notify();
+    }
+
+    pub fn create_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.new_file.as_mut() else {
+            return;
+        };
+        if draft.creating {
+            return;
+        }
+        draft.creating = true;
+        let parent = draft.parent.clone();
+        let input = draft.input.clone();
+        let name = input.read(cx).value().to_string();
+        let generation = self.project_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::document::create(&parent, &name) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.project_generation != generation {
+                    return;
+                }
+                if this
+                    .new_file
+                    .as_ref()
+                    .is_none_or(|draft| draft.input != input)
+                {
+                    return;
+                }
+                match result {
+                    Ok(path) => {
+                        this.new_file = None;
+                        if let Some(parent) = path.parent() {
+                            this.load_dir(parent.to_path_buf(), cx);
+                        }
+                        this.reveal(&path, cx);
+                        this.start_index(cx);
+                        this.refresh_git(cx);
+                        this.open_file(path, None, window, cx);
+                    }
+                    Err(error) => {
+                        if let Some(draft) = &mut this.new_file {
+                            draft.error = Some(error.into());
+                            draft.creating = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Each edit replaces its tab's timer; idle workspaces do no autosave polling.
+    pub fn schedule_auto_save(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::File(file)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        file.auto_save_task = None;
+        if !Settings::get(cx).auto_save || !file.auto_save_ready() {
+            return;
+        }
+        let editor = file.editor.clone();
+        file.auto_save_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(750)).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !Settings::get(cx).auto_save { return; }
+                if let Some(ix) = this.tabs.iter().position(|tab| matches!(tab, Tab::File(file) if file.editor == editor && file.auto_save_ready())) {
+                    if this.closing_tabs || this.save_prompts > 0 {
+                        this.schedule_auto_save(ix, window, cx);
+                    } else {
+                        this.save_tab_impl(ix, false, true, window, cx);
+                    }
+                }
+            });
+        }));
+    }
+
+    pub fn format_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active else {
+            return;
+        };
+        let Some(Tab::File(file)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        let Some(kind) = crate::structured::Kind::for_path(&file.path) else {
+            return;
+        };
+        if file.formatting {
+            return;
+        }
+        file.formatting = true;
+        let source = file.editor.read(cx).value();
+        let editor = file.editor.clone();
+        let version = file.version;
+        let indent = Settings::get(cx).tab_size as usize;
+        cx.spawn_in(window, async move |this, cx| {
+            let text = source.clone();
+            let formatted = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::structured::format(kind, &text, indent, &AtomicBool::new(false))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(ix) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| matches!(tab, Tab::File(file) if file.editor == editor))
+                else {
+                    return;
+                };
+                let Tab::File(file) = &mut this.tabs[ix] else {
+                    return;
+                };
+                file.formatting = false;
+                if file.version != version || editor.read(cx).value() != source {
+                    this.status = Some("File changed while formatting. Run Format again.".into());
+                    cx.notify();
+                    return;
+                }
+                match formatted {
+                    Ok(text) if text != source.as_ref() => {
+                        editor.update(cx, |state, cx| state.replace_all(text, window, cx))
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.notify_error(error, window, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub fn save_tab(
         &mut self,
         ix: usize,
         close_after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_tab_impl(ix, close_after, false, window, cx);
+    }
+
+    fn save_tab_impl(
+        &mut self,
+        ix: usize,
+        close_after: bool,
+        automatic: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1370,6 +1564,7 @@ impl Workspace {
             return;
         };
         let path = file.path.clone();
+        let editor = file.editor.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1382,15 +1577,25 @@ impl Workspace {
                 let Some(Tab::File(file)) = this.tabs.get_mut(ix) else {
                     return;
                 };
+                if file.editor != editor {
+                    return;
+                }
                 match file.finish_save(result, cx) {
                     Ok(()) => {
-                        this.status = Some(format!("Saved {}", file.name()).into());
+                        if !automatic {
+                            this.status = Some(format!("Saved {}", file.name()).into());
+                        }
                         if close_after && !file.dirty {
                             this.remove_tab(ix, window, cx);
+                        } else {
+                            this.schedule_auto_save(ix, window, cx);
                         }
                         this.refresh_git(cx);
                     }
-                    Err(error) => this.notify_error(error, window, cx),
+                    Err(error) => {
+                        this.notify_error(error, window, cx);
+                        this.schedule_auto_save(ix, window, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -1432,6 +1637,7 @@ impl Workspace {
         } else {
             format!("Save changes to {} files?", dirty.len())
         };
+        self.save_prompts += 1;
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -1439,17 +1645,20 @@ impl Workspace {
             &["Save All", "Don't Save", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |this, cx| match answer.await {
-            Ok(0) => {
-                let saved =
-                    this.update_in(cx, |this, window, cx| this.save_all_blocking(window, cx));
-                saved.unwrap_or(false)
-            }
-            Ok(1) => {
-                let _ = this.update(cx, |this, cx| this.discard_all(cx));
-                true
-            }
-            _ => false,
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            this.update_in(cx, |this, window, cx| {
+                this.save_prompts = this.save_prompts.saturating_sub(1);
+                match answer {
+                    Ok(0) => this.save_all_blocking(window, cx),
+                    Ok(1) => {
+                        this.discard_all(cx);
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .unwrap_or(false)
         })
     }
 
@@ -1464,7 +1673,13 @@ impl Workspace {
                 continue;
             }
             let Some(job) = file.begin_save(cx) else {
-                continue;
+                self.notify_error(
+                    "A save is still finishing. Please try closing again.",
+                    window,
+                    cx,
+                );
+                ok = false;
+                break;
             };
             let result = job.run();
             if let Err(error) = file.finish_save(result, cx) {
@@ -1555,7 +1770,9 @@ impl Workspace {
             PaletteEvent::OpenFile(path) => self.open_file(path.clone(), None, window, cx),
             PaletteEvent::OpenProject(path) => self.open_path(path.clone(), window, cx),
             PaletteEvent::GoToLine(line) => {
-                if let Some(file) = self.active_file() {
+                if let Some(ix) = self.active
+                    && let Some(Tab::File(file)) = self.tabs.get_mut(ix)
+                {
                     file.go_to_line(*line, window, cx);
                 }
             }
@@ -2110,6 +2327,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                 this.terminal.update(cx, |t, cx| t.new_session(window, cx))
             }))
+            .on_action(
+                cx.listener(|this, _: &FormatDocument, window, cx| {
+                    this.format_document(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &Save, window, cx| {
                 if let Some(ix) = this.active {
                     this.save_tab(ix, false, window, cx);

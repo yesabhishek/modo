@@ -16,7 +16,9 @@ Agents like Claude Code, Codex, and Cursor write most of the code now. What you 
 
 - **Review agent work.** One scrollable diff of everything a branch changed since `main` (or any branch you pick), or only what is uncommitted. Unified or side by side, syntax highlighted, word-level changes marked. Switch between git worktrees in one click.
 - **Read and edit code.** Tree-sitter highlighting for over 25 languages, find and replace, multiple cursors, safe saves that never overwrite changes made on disk.
+- **Create and save files.** Use the Files toolbar or right-click a folder to create a file. Auto save saves after a short typing pause; turn it off in Settings > Editor when you prefer manual saves.
 - **Follow along live.** Files, the tree, and the review refresh on their own while an agent edits.
+- **Inspect structured data.** JSON opens as an expandable tree and CSV/TSV as a table. Search keys, values, or cells with `⌘F` / `Ctrl+F`; use **Source** to edit and **Format** (Alt+Shift+F) to tidy the document. Formatting is undoable and preserves JSON number precision and duplicate keys, and CSV cell contents. Native rows are virtualized; parsing and search run in the background. Structured views support up to 10 MiB and 250,000 values, with source editing available when a preview exceeds the value limit.
 - **Find anything.** Fuzzy file search, project-wide search on ripgrep's engine, and a command palette.
 - **Run commands.** A real terminal with tabs, nested horizontal and vertical splits, a full-window mode, true color, and the shell you choose: zsh, bash, fish, PowerShell, Command Prompt, Git Bash, WSL, or your own command.
 - **Look calm.** Light, Dark, Paper, Graphite, Midnight, and Black themes, with optional project gradients across the app to distinguish workspaces.
@@ -83,7 +85,7 @@ Then review what your agent did:
 | Command palette | `⌘K` | `Ctrl+K` |
 | Search in files | `⌘⇧F` | `Ctrl+Shift+F` |
 | Review changes | `⌘⇧G` | `Ctrl+Shift+G` |
-| Markdown preview | `⌘⇧V` | `Ctrl+Shift+V` |
+| File preview | `⌘⇧V` | `Ctrl+Shift+V` |
 | Terminal | `⌘J` | `Ctrl+J` |
 | Full-window terminal | `⌘⇧J` | `Ctrl+Shift+J` |
 | Settings | `⌘,` | `Ctrl+,` |

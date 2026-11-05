@@ -7,6 +7,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use gpui_kit::component::TitleBar;
+use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, AsyncApp, Bounds, Context, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, TitlebarOptions, Window,
@@ -24,6 +25,8 @@ enum Step {
     Do(Action),
     /// Click at a point in window coordinates, as the pointer would.
     Click(f32, f32),
+    Key(&'static str),
+    Input(&'static str),
     Wait(u64),
     /// Save a frame that the animation holds for this many milliseconds.
     Shot(u64),
@@ -84,6 +87,276 @@ fn theme_from_env() -> Option<ThemeChoice> {
     })
 }
 
+/// Exercises file creation and saving through the mounted workspace in a disposable project.
+fn editing_smoke() -> Vec<Step> {
+    vec![
+        Step::Wait(900),
+        act(|ws, window, cx| {
+            let root = ws.root().unwrap().to_path_buf();
+            assert!(
+                !root.join("smoke.txt").exists(),
+                "Use an empty disposable project"
+            );
+            Settings::update(cx, |s| {
+                s.auto_save = true;
+                s.watch_files = false;
+            });
+            ws.start_new_file(root, window, cx);
+        }),
+        Step::Input("smoke.txt"),
+        Step::Key("enter"),
+        Step::Wait(800),
+        act(|ws, window, cx| {
+            let file = ws.active_file().expect("created file opens in editor");
+            assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "");
+            assert!(ws.tree.rows.iter().any(|row| row.path == file.path));
+            file.editor
+                .update(cx, |editor, cx| editor.insert("first edit", window, cx));
+        }),
+        Step::Wait(350),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(file.dirty);
+            assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "");
+            file.editor
+                .update(cx, |editor, cx| editor.insert(" and more", window, cx));
+        }),
+        Step::Wait(1100),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(!file.dirty);
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                "first edit and more"
+            );
+            Settings::update(cx, |s| s.auto_save = false);
+            ws.active_file()
+                .unwrap()
+                .editor
+                .update(cx, |editor, cx| editor.insert(" manual", window, cx));
+        }),
+        Step::Wait(1100),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(file.dirty);
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                "first edit and more"
+            );
+            ws.save_tab(ws.active.unwrap(), false, window, cx);
+        }),
+        Step::Wait(400),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(!file.dirty);
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                "first edit and more manual"
+            );
+            Settings::update(cx, |s| s.auto_save = true);
+            let file = ws.active_file().unwrap();
+            file.editor
+                .update(cx, |editor, cx| editor.insert(" conflict", window, cx));
+            std::fs::write(&file.path, "external edit").unwrap();
+        }),
+        Step::Wait(1100),
+        act(|ws, _, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(file.dirty);
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                "external edit"
+            );
+            assert!(!file.auto_save_ready(), "failed revision should not retry");
+            println!(
+                "editing smoke: creation, debounce, autosave, toggle, manual save, and conflict protection passed"
+            );
+            cx.notify();
+        }),
+        act(|ws, window, cx| ws.start_new_file(ws.root().unwrap().to_path_buf(), window, cx)),
+        Step::Input("smoke.txt"),
+        Step::Key("enter"),
+        Step::Wait(400),
+        act(|ws, _, _| {
+            assert!(ws.new_file.as_ref().unwrap().error.is_some());
+            assert_eq!(
+                std::fs::read_to_string(ws.root().unwrap().join("smoke.txt")).unwrap(),
+                "external edit"
+            );
+        }),
+        Step::Key("escape"),
+        act(|ws, _, _| assert!(ws.new_file.is_none(), "Escape cancels file creation")),
+        Step::Shot(1000),
+    ]
+}
+
+/// Uses disposable fixtures to check native search, formatting, undo, and autosave.
+fn data_smoke() -> Vec<Step> {
+    const JSON: &str =
+        r#"{"outer":{"needle":"café"},"precise":1.234567890123456789,"duplicate":1,"duplicate":2}"#;
+    let find = if crate::ui::is_mac() {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+    let undo = if crate::ui::is_mac() {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    vec![
+        Step::Wait(900),
+        act(|ws, window, cx| {
+            Settings::update(cx, |s| {
+                s.auto_save = false;
+                s.watch_files = false;
+            });
+            let path = crate::document::create(ws.root().unwrap(), "data-smoke.json").unwrap();
+            std::fs::write(&path, JSON).unwrap();
+            ws.open_file(path, None, window, cx);
+        }),
+        Step::Wait(800),
+        act(|ws, _, cx| {
+            assert_eq!(
+                ws.active_file().unwrap().capture_data_state(cx),
+                Some((5, false, None))
+            );
+        }),
+        Step::Key(find),
+        Step::Input("CAFÉ"),
+        Step::Wait(400),
+        act(|ws, window, cx| {
+            assert_eq!(
+                ws.active_file().unwrap().capture_data_state(cx),
+                Some((3, false, None))
+            );
+            ws.format_document(window, cx);
+        }),
+        Step::Wait(500),
+        act(|ws, window, cx| {
+            let ix = ws.active.unwrap();
+            let Tab::File(file) = &mut ws.tabs[ix] else {
+                panic!()
+            };
+            let text = file.editor.read(cx).value();
+            assert!(file.dirty);
+            assert!(text.contains("\n"));
+            assert!(text.contains("1.234567890123456789"));
+            assert_eq!(text.matches("\"duplicate\":").count(), 2);
+            assert_eq!(file.capture_data_state(cx), Some((3, false, None)));
+            file.toggle_preview(window, cx);
+        }),
+        Step::Key(undo),
+        Step::Wait(100),
+        act(|ws, window, cx| {
+            assert_eq!(
+                ws.active_file().unwrap().editor.read(cx).value().as_ref(),
+                JSON
+            );
+            Settings::update(cx, |s| {
+                s.auto_save = true;
+                s.format_on_save_trim = true;
+            });
+            let path = crate::document::create(ws.root().unwrap(), "data-smoke.csv").unwrap();
+            std::fs::write(
+                &path,
+                "\"name\",\"value\"\nAda,\"hello,\nworld\"\nLin, padded  \n",
+            )
+            .unwrap();
+            ws.open_file(path, None, window, cx);
+        }),
+        Step::Wait(800),
+        act(|ws, _, cx| {
+            assert_eq!(
+                ws.active_file().unwrap().capture_data_state(cx),
+                Some((2, false, None))
+            )
+        }),
+        Step::Key(find),
+        Step::Input("world"),
+        Step::Wait(400),
+        act(|ws, window, cx| {
+            assert_eq!(
+                ws.active_file().unwrap().capture_data_state(cx),
+                Some((1, false, None))
+            );
+            ws.format_document(window, cx);
+        }),
+        Step::Wait(1200),
+        act(|ws, _, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(!file.dirty);
+            let disk = std::fs::read_to_string(&file.path).unwrap();
+            assert_eq!(disk, "name,value\nAda,\"hello,\nworld\"\nLin, padded  \n");
+            assert_eq!(file.capture_data_state(cx), Some((1, false, None)));
+            println!(
+                "data smoke: JSON tree search, lossless format, undo, CSV search, formatting, and autosave passed"
+            );
+        }),
+        Step::Shot(1000),
+    ]
+}
+
+fn save_race_smoke() -> Vec<Step> {
+    let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let save_result = result.clone();
+    vec![
+        Step::Wait(900),
+        act(|ws, window, cx| {
+            Settings::update(cx, |s| {
+                s.auto_save = false;
+                s.watch_files = false;
+            });
+            let path = crate::document::create(ws.root().unwrap(), "save-race.txt").unwrap();
+            ws.open_file(path, None, window, cx);
+        }),
+        Step::Wait(500),
+        Step::Input("snapshot"),
+        Step::Wait(100),
+        act(move |ws, _, cx| {
+            let Tab::File(file) = &mut ws.tabs[ws.active.unwrap()] else {
+                panic!()
+            };
+            *save_result.borrow_mut() = Some(file.begin_save(cx).unwrap().run());
+        }),
+        Step::Input(" + newer edit"),
+        Step::Wait(100),
+        act(move |ws, window, cx| {
+            let Tab::File(file) = &mut ws.tabs[ws.active.unwrap()] else {
+                panic!()
+            };
+            file.finish_save(result.borrow_mut().take().unwrap(), cx)
+                .unwrap();
+            assert!(
+                file.dirty,
+                "a completed old snapshot must not clear newer edits"
+            );
+            assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "snapshot");
+            Settings::update(cx, |s| s.auto_save = true);
+            let other = crate::document::create(ws.root().unwrap(), "other.txt").unwrap();
+            ws.open_file(other, None, window, cx);
+        }),
+        Step::Wait(1200),
+        act(|ws, _, _| {
+            let path = ws.root().unwrap().join("save-race.txt");
+            let ix = ws.tab_for_path(&path).unwrap();
+            assert_ne!(ws.active, Some(ix));
+            let Tab::File(file) = &ws.tabs[ix] else {
+                panic!()
+            };
+            assert!(!file.dirty);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "snapshot + newer edit"
+            );
+            println!(
+                "save race smoke: newer edits survive an in-flight save and background tabs autosave"
+            );
+        }),
+        Step::Shot(1000),
+    ]
+}
+
 fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
     let want_preview = scene == "preview";
     let want_reviewed = scene == "review-progress";
@@ -140,6 +413,11 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
                     }
                 }
                 "settings" => ws.open_settings(window, cx),
+                "new-file" => {
+                    if let Some(root) = ws.root().map(std::path::Path::to_path_buf) {
+                        ws.start_new_file(root, window, cx);
+                    }
+                }
                 "settings-terminal" => {
                     ws.open_settings(window, cx);
                     if let Some(view) = ws.settings.clone() {
@@ -387,6 +665,9 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
     let many = scene == "tour";
     let steps = match (many, root) {
         (true, Some(root)) => tour(root),
+        _ if scene == "editing-smoke" => editing_smoke(),
+        _ if scene == "data-smoke" => data_smoke(),
+        _ if scene == "save-race-smoke" => save_race_smoke(),
         _ if scene == "live" => live(file.expect("MODO_CAPTURE_FILE")),
         _ => single(&scene, file),
     };
@@ -399,9 +680,23 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
         for step in steps {
             match step {
                 Step::Wait(ms) => {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(ms))
-                        .await
+                    // Offscreen windows have no display link. Pump frames while
+                    // async loads settle, including child views mounted by a load.
+                    let mut remaining = ms;
+                    while remaining > 0 {
+                        let delay = remaining.min(100);
+                        cx.background_executor()
+                            .timer(Duration::from_millis(delay))
+                            .await;
+                        let _ = handle.update(cx, |_, window, cx| window.draw(cx).clear(cx));
+                        remaining -= delay;
+                    }
+                }
+                Step::Key(key) => {
+                    let _ = handle.update(cx, |_, window, cx| window.press(key, cx));
+                }
+                Step::Input(text) => {
+                    let _ = handle.update(cx, |_, window, cx| window.input(text, cx));
                 }
                 Step::Click(x, y) => {
                     let _ = handle.update(cx, |_, window, cx| click(window, x, y, cx));

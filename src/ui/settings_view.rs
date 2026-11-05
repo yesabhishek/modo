@@ -266,6 +266,13 @@ impl SettingsView {
                     cx,
                 ),
                 toggle(
+                    "Auto save",
+                    "Save files after a short pause in typing. Conflicting disk changes stay protected.",
+                    s.auto_save,
+                    |s, v| s.auto_save = v,
+                    cx,
+                ),
+                toggle(
                     "Trim trailing whitespace",
                     "Remove spaces at line ends when saving.",
                     s.format_on_save_trim,
@@ -411,6 +418,8 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Review changes", "⌘⇧G", "Ctrl+Shift+G"),
     ("Show files", "⌘⇧E", "Ctrl+Shift+E"),
     ("Find in file", "⌘F", "Ctrl+F"),
+    ("File preview", "⌘⇧V", "Ctrl+Shift+V"),
+    ("Format JSON / CSV", "⌥⇧F", "Alt+Shift+F"),
     ("Replace in file", "⌥⌘F", "Ctrl+H"),
     ("Go to line", "⌃G", "Ctrl+G"),
     ("Toggle terminal", "⌘J  or  ⌃`", "Ctrl+J  or  Ctrl+`"),

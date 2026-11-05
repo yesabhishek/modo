@@ -218,6 +218,13 @@ fn commands() -> Vec<Command> {
             "",
             Lucide::ListTree,
         ),
+        c(
+            "Format JSON / CSV document",
+            Box::new(ws::FormatDocument),
+            "⌥⇧F",
+            "Alt+Shift+F",
+            Lucide::Code,
+        ),
         c("Save", Box::new(ws::Save), "⌘S", "Ctrl+S", Lucide::Save),
         c(
             "Save all",
@@ -241,7 +248,7 @@ fn commands() -> Vec<Command> {
             Lucide::TextWrap,
         ),
         c(
-            "Toggle markdown preview",
+            "Toggle file preview",
             Box::new(ws::ToggleMarkdownPreview),
             "⇧⌘V",
             "Ctrl+Shift+V",

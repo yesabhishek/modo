@@ -73,6 +73,7 @@ pub struct Settings {
     pub indent_guides: bool,
     pub tab_size: u8,
     pub format_on_save_trim: bool,
+    pub auto_save: bool,
     pub terminal_font_size: f32,
     /// The profile new terminals start with. Empty means the platform default.
     pub terminal_profile: String,
@@ -100,6 +101,7 @@ impl Default for Settings {
             indent_guides: true,
             tab_size: 4,
             format_on_save_trim: false,
+            auto_save: true,
             terminal_font_size: 12.5,
             terminal_profile: String::new(),
             terminal_shell: String::new(),
@@ -270,5 +272,11 @@ mod tests {
         assert_eq!(parsed.editor_font_size, 28.0);
         assert_eq!(parsed.theme, ThemeChoice::System);
         assert!(parsed.line_numbers);
+        assert!(parsed.auto_save);
+        let settings: Settings = serde_json::from_str(r#"{"auto_save":false}"#).unwrap();
+        assert!(!settings.auto_save);
+        let restored: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(!restored.auto_save);
     }
 }

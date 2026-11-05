@@ -73,6 +73,26 @@ pub fn load(path: &Path) -> Result<LoadedFile, String> {
     })
 }
 
+/// Create a single file without replacing an existing file or following a leaf symlink.
+pub fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || name.trim() != name
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '\0'])
+        || Path::new(name).is_absolute()
+    {
+        return Err("Enter a file name without folders or surrounding spaces.".into());
+    }
+    let path = parent.join(name);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("Cannot create {name}: {error}"))?;
+    Ok(path)
+}
+
 pub fn fingerprint(path: &Path) -> Result<Option<blake3::Hash>, String> {
     match fs::File::open(path) {
         Ok(mut file) => {
@@ -135,6 +155,53 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn create_opens_empty_utf8_file_without_overwriting_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create(dir.path(), "notes café.md").unwrap();
+        assert_eq!(load(&path).unwrap().text, "");
+        fs::write(&path, "keep this").unwrap();
+        assert!(create(dir.path(), "notes café.md").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "keep this");
+        fs::create_dir(dir.path().join("folder")).unwrap();
+        assert!(create(dir.path(), "folder").is_err());
+        assert!(create(&dir.path().join("missing"), "file.txt").is_err());
+    }
+
+    #[test]
+    fn create_rejects_paths_and_invalid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "",
+            " ",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/absolute",
+            "C:escape",
+            "file\0",
+            " file",
+            "file ",
+        ] {
+            assert!(create(dir.path(), name).is_err(), "accepted {name:?}");
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(create(dir.path(), ".env").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_never_follows_existing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        assert!(create(dir.path(), "link").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
+
     #[test]
     fn roundtrip_bom_crlf_and_unicode() {
         let dir = tempfile::tempdir().unwrap();

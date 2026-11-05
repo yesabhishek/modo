@@ -2,7 +2,7 @@
 
 1. Update `version` in `Cargo.toml` and the top entry of `CHANGELOG.md`.
 2. Push the reviewed commit to `main` in `yesabhishek/modo` and wait for CI to pass on every platform.
-3. Tag that commit and push the tag to the Modo remote: `git tag v0.3.2 && git push modo v0.3.2` (use `origin` if it points to `yesabhishek/modo`).
+3. Tag that commit and push the tag to the Modo remote: `git tag v0.4.0 && git push modo v0.4.0` (use `origin` if it points to `yesabhishek/modo`).
 4. The Release workflow builds every platform and publishes a GitHub release with the installers, checksums, and install notes from the top changelog entry. Include all changes since the previous public release in that entry.
 
 ## Build installers locally

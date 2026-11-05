@@ -12,11 +12,11 @@ use std::{
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt as _,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt as _,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::{DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     spinner::Spinner,
     v_flex,
 };
@@ -30,8 +30,8 @@ use gpui_kit::{
 use super::{
     NavRow, drag_region, icon_button, is_mac, kbd, r, section_label, shortcut,
     workspace::{
-        FindInFiles, OpenFolder, OpenSettings, Panel, QuickOpen, RefreshProject, ReviewChanges,
-        ShowFiles, ShowTodos, ToggleSidebar, ToggleWindowColor, Workspace,
+        Dismiss, FindInFiles, OpenFolder, OpenSettings, Panel, QuickOpen, RefreshProject,
+        ReviewChanges, ShowFiles, ShowTodos, ToggleSidebar, ToggleWindowColor, Workspace,
     },
 };
 use crate::{
@@ -467,8 +467,11 @@ fn panel_header(
         .child(
             h_flex()
                 .gap(r(2.))
-                .invisible()
-                .group_hover("panel-header", |s| s.visible())
+                .when(title != "Files", |actions| {
+                    actions
+                        .invisible()
+                        .group_hover("panel-header", |s| s.visible())
+                })
                 .children(actions),
         )
 }
@@ -479,6 +482,28 @@ fn render_files(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement
     let header = panel_header(
         "Files",
         [
+            icon_button("files-new", Lucide::FilePlus, cx)
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("New file").build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let parent = this
+                        .tree
+                        .selected
+                        .as_ref()
+                        .and_then(|path| {
+                            if path.is_dir() {
+                                Some(path.clone())
+                            } else {
+                                path.parent().map(Path::to_path_buf)
+                            }
+                        })
+                        .or_else(|| this.root().map(Path::to_path_buf));
+                    if let Some(parent) = parent {
+                        this.start_new_file(parent, window, cx);
+                    }
+                }))
+                .into_any_element(),
             icon_button("files-collapse", Lucide::ChevronsDownUp, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx)))
                 .into_any_element(),
@@ -492,6 +517,74 @@ fn render_files(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement
     v_flex()
         .size_full()
         .child(header)
+        .when_some(this.new_file.as_ref(), |col, draft| {
+            let parent = this
+                .root()
+                .map(|root| files::display_relative(root, &draft.parent))
+                .unwrap_or_default();
+            col.child(
+                v_flex()
+                    .key_context("NewFile")
+                    .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                        if this.new_file.as_ref().is_some_and(|draft| !draft.creating) {
+                            this.new_file = None;
+                            this.focus.focus(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .px(r(14.))
+                    .py(r(8.))
+                    .gap(r(6.))
+                    .child(
+                        div()
+                            .text_size(r(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if parent.is_empty() {
+                                "New file in project".to_owned()
+                            } else {
+                                format!("New file in {parent}")
+                            }),
+                    )
+                    .child(Input::new(&draft.input).small())
+                    .when_some(draft.error.clone(), |col, error| {
+                        col.child(
+                            div()
+                                .text_size(r(12.))
+                                .text_color(cx.theme().red)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap(r(6.))
+                            .child(
+                                Button::new("create-file")
+                                    .disabled(draft.creating)
+                                    .small()
+                                    .label(if draft.creating {
+                                        "Creating…"
+                                    } else {
+                                        "Create"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_file(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("cancel-create-file")
+                                    .disabled(draft.creating)
+                                    .small()
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_file = None;
+                                        this.focus.focus(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+        })
         .when_some(error, |col, error| {
             col.child(
                 div()
@@ -554,6 +647,8 @@ fn render_tree_row(
     };
     let path = row.path.clone();
     let directory = row.directory;
+    let menu_path = path.clone();
+    let workspace = cx.weak_entity();
     let row_el = h_flex()
         .id(("tree-row", ix))
         .w_full()
@@ -597,6 +692,22 @@ fn render_tree_row(
                 this.open_file(path.clone(), None, window, cx);
             }
         }));
+    let row_el = if directory {
+        row_el
+            .context_menu(move |menu, _, _| {
+                let path = menu_path.clone();
+                let workspace = workspace.clone();
+                menu.item(
+                    PopupMenuItem::new("New file…").on_click(move |_, window, cx| {
+                        let _ = workspace
+                            .update(cx, |this, cx| this.start_new_file(path.clone(), window, cx));
+                    }),
+                )
+            })
+            .into_any_element()
+    } else {
+        row_el.into_any_element()
+    };
     div().w_full().px(r(6.)).child(row_el).into_any_element()
 }
 

@@ -13,6 +13,7 @@ mod search;
 mod settings;
 mod shells;
 mod startup;
+mod structured;
 mod theme;
 mod todos;
 mod ui;
@@ -176,7 +177,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("To-dos", ws::ShowTodos),
                 MenuItem::action("Toggle Project Gradient", ws::ToggleWindowColor),
                 MenuItem::action("Toggle Word Wrap", ws::ToggleSoftWrap),
-                MenuItem::action("Toggle Markdown Preview", ws::ToggleMarkdownPreview),
+                MenuItem::action("Toggle File Preview", ws::ToggleMarkdownPreview),
+                MenuItem::action("Format Document", ws::FormatDocument),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ws::ZoomIn),
                 MenuItem::action("Zoom Out", ws::ZoomOut),

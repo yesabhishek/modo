@@ -10,17 +10,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
 };
 
 use super::{
     icon_button, preview, r,
-    workspace::{Tab, ToggleMarkdownPreview, Workspace},
+    workspace::{FormatDocument, Tab, ToggleMarkdownPreview, Workspace},
 };
 use crate::{
     document::{self, LineEnding, LoadedFile},
     files,
     settings::Settings,
+    structured::Kind,
 };
 
 /// Files above this size open without syntax highlighting to stay instant.
@@ -37,10 +38,16 @@ pub struct FileTab {
     /// Bumps on every edit, so a save can tell whether it captured the latest text.
     pub version: u64,
     saving: Option<u64>,
+    pub auto_save_task: Option<Task<()>>,
+    auto_save_failed: Option<u64>,
     /// The file changed on disk while it had unsaved edits.
     pub disk_changed: bool,
     /// Show the rendered markdown instead of the source.
     pub preview: bool,
+    structured_kind: Option<Kind>,
+    structured_view: Option<Entity<super::data_view::DataView>>,
+    structured_version: Option<u64>,
+    pub formatting: bool,
     /// The text last handed to the preview, and the edit version it came from.
     preview_text: Option<(u64, SharedString)>,
     applied: Option<Settings>,
@@ -94,6 +101,8 @@ impl FileTab {
         } else {
             files::language_for(&file.path)
         };
+        let structured_kind = Kind::for_path(&file.path);
+        let preview = structured_kind.is_some() && !file.text.is_empty();
         let text = file.text;
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -108,17 +117,19 @@ impl FileTab {
         let subscription = cx.subscribe_in(
             &editor,
             window,
-            |this: &mut Workspace, editor, event, _, cx| {
-                if let InputEvent::Change = event {
-                    for tab in &mut this.tabs {
-                        if let Tab::File(file) = tab
-                            && &file.editor == editor
-                        {
-                            file.dirty = true;
-                            file.version += 1;
-                            this.status = None;
-                        }
+            |this: &mut Workspace, editor, event, window, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(ix) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| matches!(tab, Tab::File(file) if &file.editor == editor))
+                {
+                    if let Tab::File(file) = &mut this.tabs[ix] {
+                        file.dirty = true;
+                        file.version += 1;
                     }
+                    this.status = None;
+                    this.schedule_auto_save(ix, window, cx);
                     cx.notify();
                 }
             },
@@ -133,12 +144,25 @@ impl FileTab {
             dirty: false,
             version: 0,
             saving: None,
+            auto_save_task: None,
+            auto_save_failed: None,
             disk_changed: false,
-            preview: false,
+            preview,
+            structured_kind,
+            structured_view: None,
+            structured_version: None,
+            formatting: false,
             preview_text: None,
             applied: Some(settings),
             _subscription: subscription,
         }
+    }
+
+    #[cfg(feature = "capture")]
+    pub fn capture_data_state(&self, cx: &App) -> Option<(usize, bool, Option<SharedString>)> {
+        self.structured_view
+            .as_ref()
+            .map(|view| view.read(cx).capture_state())
     }
 
     pub fn is_markdown(&self) -> bool {
@@ -147,15 +171,14 @@ impl FileTab {
 
     /// Flip between the markdown source and its rendered preview.
     pub fn toggle_preview(&mut self, window: &mut Window, cx: &mut App) {
-        if !self.is_markdown() {
+        if !self.is_markdown() && self.structured_kind.is_none() {
             return;
         }
         self.preview = !self.preview;
-        if self.preview {
+        if self.preview && self.is_markdown() {
             preview::warm_up();
-        } else {
-            self.focus(window, cx);
         }
+        self.focus(window, cx);
     }
 
     fn preview_source(&mut self, cx: &App) -> SharedString {
@@ -178,12 +201,20 @@ impl FileTab {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.editor.update(cx, |state, cx| state.focus(window, cx));
+        if self.preview
+            && let Some(view) = &self.structured_view
+        {
+            view.update(cx, |view, cx| view.focus(window, cx));
+        } else {
+            self.editor.update(cx, |state, cx| state.focus(window, cx));
+        }
     }
 
-    pub fn go_to_line(&self, line: u32, window: &mut Window, cx: &mut App) {
+    pub fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut App) {
+        self.preview = false;
         self.editor.update(cx, |state, cx| {
             state.set_cursor_position(Position::new(line.saturating_sub(1), 0), window, cx);
+            state.focus(window, cx);
         });
     }
 
@@ -209,12 +240,21 @@ impl FileTab {
         self.applied = Some(settings);
     }
 
+    pub fn auto_save_ready(&self) -> bool {
+        self.dirty
+            && !self.disk_changed
+            && self.saving.is_none()
+            && self.auto_save_failed != Some(self.version)
+    }
+
     pub fn begin_save(&mut self, cx: &App) -> Option<SaveJob> {
         if self.saving.is_some() {
             return None;
         }
         let mut text = self.editor.read(cx).value().to_string();
-        if Settings::get(cx).format_on_save_trim {
+        if Settings::get(cx).format_on_save_trim
+            && !matches!(self.structured_kind, Some(Kind::Csv(_)))
+        {
             text = trim_trailing_whitespace(&text);
         }
         self.saving = Some(self.version);
@@ -234,7 +274,11 @@ impl FileTab {
         _cx: &mut App,
     ) -> Result<(), SharedString> {
         self.saving = None;
-        let hash = result.map_err(SharedString::from)?;
+        let hash = result.map_err(|error| {
+            self.auto_save_failed = Some(version);
+            SharedString::from(error)
+        })?;
+        self.auto_save_failed = None;
         self.fingerprint = hash;
         self.disk_changed = false;
         // Edits made while the save ran stay dirty.
@@ -271,6 +315,7 @@ impl FileTab {
             state.set_cursor_position(position, window, cx);
         });
         self.preview_text = None;
+        self.structured_version = None;
         self.dirty = false;
         self.disk_changed = false;
     }
@@ -291,7 +336,12 @@ impl FileTab {
             indent: format!("Spaces: {}", settings.tab_size).into(),
             encoding: if self.bom { "UTF-8 BOM" } else { "UTF-8" }.into(),
             line_ending: self.line_ending.label().into(),
-            language: files::language_label(self.language).into(),
+            language: match self.structured_kind {
+                Some(Kind::Csv(b'\t')) => "TSV",
+                Some(Kind::Csv(_)) => "CSV",
+                _ => files::language_label(self.language),
+            }
+            .into(),
         }
     }
 
@@ -324,8 +374,24 @@ impl FileTab {
         });
         let path = self.path.clone();
         let is_markdown = self.is_markdown();
-        let previewing = self.preview && is_markdown;
-        let preview_source = previewing.then(|| self.preview_source(cx));
+        let can_preview = is_markdown || self.structured_kind.is_some();
+        let previewing = self.preview && can_preview;
+        if previewing
+            && let Some(kind) = self.structured_kind
+            && self.structured_version != Some(self.version)
+        {
+            let source = self.preview_source(cx);
+            if let Some(view) = &self.structured_view {
+                view.update(cx, |view, cx| view.set_source(source, cx));
+            } else {
+                let view = cx.new(|cx| super::data_view::DataView::new(kind, source, window, cx));
+                view.update(cx, |view, cx| view.focus(window, cx));
+                self.structured_view = Some(view);
+            }
+            self.structured_version = Some(self.version);
+        }
+        let structured = previewing.then(|| self.structured_view.clone()).flatten();
+        let preview_source = (previewing && is_markdown).then(|| self.preview_source(cx));
         let scroll_id = SharedString::from(format!("preview:{}", self.path.display()));
         v_flex()
             .size_full()
@@ -338,7 +404,37 @@ impl FileTab {
                     .text_size(r(12.5))
                     .text_color(theme.muted_foreground)
                     .child(h_flex().flex_1().min_w_0().gap(r(6.)).children(crumbs))
-                    .when(is_markdown, |bar| {
+                    .when(self.structured_kind.is_some() && !previewing, |bar| {
+                        bar.child(
+                            gpui_kit::component::button::Button::new("format-document")
+                                .small()
+                                .label(if self.formatting {
+                                    "Formatting…"
+                                } else {
+                                    "Format"
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(FormatDocument), cx)
+                                }),
+                        )
+                    })
+                    .when_some(self.structured_kind, |bar, kind| {
+                        bar.child(
+                            gpui_kit::component::button::Button::new("toggle-data-view")
+                                .small()
+                                .label(if previewing {
+                                    "Source"
+                                } else if kind == Kind::Json {
+                                    "JSON tree"
+                                } else {
+                                    "Table"
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ToggleMarkdownPreview), cx)
+                                }),
+                        )
+                    })
+                    .when(can_preview && self.structured_kind.is_none(), |bar| {
                         bar.child(
                             icon_button(
                                 "toggle-markdown-preview",
@@ -353,7 +449,7 @@ impl FileTab {
                                 Tooltip::new(if previewing {
                                     "Edit source (⇧⌘V)"
                                 } else {
-                                    "Preview markdown (⇧⌘V)"
+                                    "Preview file (⇧⌘V)"
                                 })
                                 .build(window, cx)
                             })
@@ -406,25 +502,29 @@ impl FileTab {
                         ),
                 )
             })
-            .child(match preview_source {
-                Some(text) => div()
-                    .id(scroll_id.clone())
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(preview::body(scroll_id, text, cx))
-                    .into_any_element(),
-                None => div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        Editor::new(&self.editor)
-                            .bordered(false)
-                            .appearance(false)
-                            .size_full()
-                            .xsmall(),
-                    )
-                    .into_any_element(),
+            .child(if let Some(view) = structured {
+                div().flex_1().min_h_0().child(view).into_any_element()
+            } else {
+                match preview_source {
+                    Some(text) => div()
+                        .id(scroll_id.clone())
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(preview::body(scroll_id, text, cx))
+                        .into_any_element(),
+                    None => div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            Editor::new(&self.editor)
+                                .bordered(false)
+                                .appearance(false)
+                                .size_full()
+                                .xsmall(),
+                        )
+                        .into_any_element(),
+                }
             })
     }
 }
