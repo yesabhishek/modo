@@ -1,9 +1,9 @@
-//! Settings, laid out like Notion's: a quiet category list on the left and
-//! labelled rows with a control on the right.
+//! Settings: a short category list on the left, and on the right a few
+//! bordered groups of one-line rows, each ending in a single control.
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt as _,
-    button::Button,
+    ActiveTheme, Disableable as _, Icon, IconName, Sizable, StyledExt as _,
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -13,14 +13,16 @@ use gpui_kit::component::{
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
     prelude::FluentBuilder, px,
 };
 
 use super::{r, shortcut};
 use crate::{
+    brand,
     settings::{ReviewBase, ReviewLayout, Settings, ThemeChoice},
     shells,
+    updater::{self, Phase, UpdateState},
 };
 
 pub enum SettingsEvent {
@@ -30,41 +32,37 @@ pub enum SettingsEvent {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
-    Appearance,
+    General,
     Editor,
     Terminal,
-    Review,
     Shortcuts,
     About,
 }
 
 impl Category {
-    const ALL: [Self; 6] = [
-        Self::Appearance,
+    const ALL: [Self; 5] = [
+        Self::General,
         Self::Editor,
         Self::Terminal,
-        Self::Review,
         Self::Shortcuts,
         Self::About,
     ];
     fn label(self) -> &'static str {
         match self {
-            Self::Appearance => "Appearance",
+            Self::General => "General",
             Self::Editor => "Editor",
             Self::Terminal => "Terminal",
-            Self::Review => "Review",
             Self::Shortcuts => "Shortcuts",
             Self::About => "About",
         }
     }
     fn icon(self) -> Lucide {
         match self {
-            Self::Appearance => Lucide::Paintbrush,
+            Self::General => Lucide::SlidersHorizontal,
             Self::Editor => Lucide::Code,
             Self::Terminal => Lucide::Terminal,
-            Self::Review => Lucide::GitCompare,
             Self::Shortcuts => Lucide::Keyboard,
-            Self::About => Lucide::CircleDot,
+            Self::About => Lucide::Info,
         }
     }
 }
@@ -73,8 +71,10 @@ pub struct SettingsView {
     focus: FocusHandle,
     category: Category,
     gradient_enabled: bool,
-    font_input: Entity<InputState>,
     shell_input: Entity<InputState>,
+    /// Installed monospace families; `None` while the scan runs.
+    fonts: Option<Vec<SharedString>>,
+    _fonts: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -83,12 +83,6 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 impl SettingsView {
     pub fn new(gradient_enabled: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = Settings::get(cx).clone();
-        let default_font = crate::theme::mono_font("", cx);
-        let font_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(format!("{default_font} (default)"))
-                .default_value(settings.editor_font_family.clone())
-        });
         let shell_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(if cfg!(windows) {
@@ -99,16 +93,6 @@ impl SettingsView {
                 .default_value(settings.terminal_shell.clone())
         });
         let subscriptions = vec![
-            cx.subscribe_in(
-                &font_input,
-                window,
-                |_, input, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                        let value = input.read(cx).value().trim().to_owned();
-                        Settings::update(cx, |s| s.editor_font_family = value);
-                    }
-                },
-            ),
             cx.subscribe_in(
                 &shell_input,
                 window,
@@ -129,18 +113,35 @@ impl SettingsView {
                     }
                 },
             ),
+            cx.observe_global::<Settings>(|_, cx| cx.notify()),
+            cx.observe_global::<UpdateState>(|_, cx| cx.notify()),
         ];
+        // Both steps are slow enough to notice (listing every family, then
+        // reading which are monospace), so neither runs on the UI thread.
+        let text_system = cx.text_system().clone();
+        let fonts = cx.spawn(async move |this, cx| {
+            let families = cx
+                .background_executor()
+                .spawn(
+                    async move { crate::theme::monospace_families(&text_system.all_font_names()) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.fonts = Some(families.into_iter().map(SharedString::from).collect());
+                cx.notify();
+            });
+        });
         Self {
             focus: cx.focus_handle(),
-            category: Category::Appearance,
+            category: Category::General,
             gradient_enabled,
-            font_input,
             shell_input,
+            fonts: None,
+            _fonts: fonts,
             _subscriptions: subscriptions,
         }
     }
 
-    #[cfg(feature = "capture")]
     pub fn show_about(&mut self, cx: &mut Context<Self>) {
         self.category = Category::About;
         cx.notify();
@@ -161,253 +162,299 @@ impl SettingsView {
         cx.notify();
     }
 
+    #[cfg(feature = "capture")]
+    pub fn show_editor(&mut self, cx: &mut Context<Self>) {
+        self.category = Category::Editor;
+        cx.notify();
+    }
+
     fn render_category(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let s = Settings::get(cx).clone();
         match self.category {
-            Category::Appearance => vec![
-                heading("Theme", cx),
-                theme_picker(s.theme, cx),
-                row(
-                    "Project gradients",
-                    "A subtle background gradient across the app, unique to each project.",
-                    Switch::new("project-gradients")
-                        .checked(self.gradient_enabled)
-                        .on_click(cx.listener(|this, enabled: &bool, _, cx| {
-                            this.gradient_enabled = *enabled;
-                            Settings::update(cx, |settings| settings.window_colors = *enabled);
-                            cx.emit(SettingsEvent::ProjectGradient(*enabled));
-                            cx.notify();
-                        }))
-                        .into_any_element(),
+            Category::General => vec![
+                group(
+                    "Theme",
+                    vec![
+                        theme_picker(s.theme, cx),
+                        row(
+                            "Interface size",
+                            stepper(
+                                "zoom",
+                                format!("{}%", (s.zoom * 100.).round()),
+                                |s| s.zoom -= 0.1,
+                                |s| s.zoom += 0.1,
+                                cx,
+                            ),
+                        ),
+                        row_hint(
+                            "Project gradient",
+                            "A faint tint, different for each project.",
+                            Switch::new("project-gradients")
+                                .small()
+                                .checked(self.gradient_enabled)
+                                .on_click(cx.listener(|this, enabled: &bool, _, cx| {
+                                    this.gradient_enabled = *enabled;
+                                    Settings::update(cx, |settings| {
+                                        settings.window_colors = *enabled
+                                    });
+                                    cx.emit(SettingsEvent::ProjectGradient(*enabled));
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                            cx,
+                        ),
+                    ],
                     cx,
                 ),
-                toggle(
-                    "Show hidden files",
-                    "Include files and folders whose names start with a dot.",
-                    s.show_hidden_files,
-                    |s, v| s.show_hidden_files = v,
+                group(
+                    "Files",
+                    vec![
+                        toggle("Show hidden files", s.show_hidden_files, |s, v| {
+                            s.show_hidden_files = v
+                        }),
+                        toggle("Show ignored files", s.show_ignored_files, |s, v| {
+                            s.show_ignored_files = v
+                        }),
+                        toggle_hint(
+                            "Follow changes on disk",
+                            "Reload files and the review as agents edit.",
+                            s.watch_files,
+                            |s, v| s.watch_files = v,
+                            cx,
+                        ),
+                        toggle("Reopen tabs on launch", s.restore_session, |s, v| {
+                            s.restore_session = v
+                        }),
+                    ],
                     cx,
                 ),
-                toggle(
-                    "Show ignored files",
-                    "Show files excluded by .ignore and .gitignore with muted labels.",
-                    s.show_ignored_files,
-                    |s, v| s.show_ignored_files = v,
-                    cx,
-                ),
-                row(
-                    "Interface size",
-                    "Scales text and controls across the whole window.",
-                    stepper(
-                        "zoom",
-                        format!("{}%", (s.zoom * 100.).round()),
-                        |s| s.zoom -= 0.1,
-                        |s| s.zoom += 0.1,
-                        cx,
-                    ),
+                group(
+                    "Review",
+                    vec![
+                        row(
+                            "Compare against",
+                            segmented(
+                                "base",
+                                &[
+                                    ("Base branch", ReviewBase::Branch),
+                                    ("Uncommitted", ReviewBase::Uncommitted),
+                                ],
+                                s.review_base,
+                                |s, v| s.review_base = v,
+                                cx,
+                            ),
+                        ),
+                        row(
+                            "Layout",
+                            segmented(
+                                "layout",
+                                &[
+                                    ("Unified", ReviewLayout::Unified),
+                                    ("Split", ReviewLayout::Split),
+                                ],
+                                s.review_layout,
+                                |s, v| s.review_layout = v,
+                                cx,
+                            ),
+                        ),
+                    ],
                     cx,
                 ),
             ],
             Category::Editor => vec![
-                heading("Text", cx),
-                row(
-                    "Font",
-                    "Any installed monospace family.",
-                    div()
-                        .w(r(220.))
-                        .child(Input::new(&self.font_input).small())
-                        .into_any_element(),
+                group(
+                    "Text",
+                    vec![
+                        row("Font", self.font_picker(&s, cx)),
+                        row(
+                            "Font size",
+                            stepper(
+                                "font-size",
+                                format!("{}", s.editor_font_size),
+                                |s| s.editor_font_size -= 1.,
+                                |s| s.editor_font_size += 1.,
+                                cx,
+                            ),
+                        ),
+                        row(
+                            "Tab size",
+                            segmented(
+                                "tab",
+                                &[("2", 2u8), ("4", 4), ("8", 8)],
+                                s.tab_size,
+                                |s, v| s.tab_size = v,
+                                cx,
+                            ),
+                        ),
+                    ],
                     cx,
                 ),
-                row(
-                    "Font size",
-                    "Code size in points.",
-                    stepper(
-                        "font-size",
-                        format!("{}", s.editor_font_size),
-                        |s| s.editor_font_size -= 1.,
-                        |s| s.editor_font_size += 1.,
-                        cx,
-                    ),
+                group(
+                    "Display",
+                    vec![
+                        toggle("Word wrap", s.soft_wrap, |s, v| s.soft_wrap = v),
+                        toggle("Line numbers", s.line_numbers, |s, v| s.line_numbers = v),
+                        toggle("Indent guides", s.indent_guides, |s, v| s.indent_guides = v),
+                    ],
                     cx,
                 ),
-                row(
-                    "Tab size",
-                    "Spaces inserted for one indent.",
-                    segmented(
-                        "tab",
-                        &[("2", 2u8), ("4", 4), ("8", 8)],
-                        s.tab_size,
-                        |s, v| s.tab_size = v,
-                        cx,
-                    ),
-                    cx,
-                ),
-                heading("Behavior", cx),
-                toggle(
-                    "Word wrap",
-                    "Wrap long lines to the window width.",
-                    s.soft_wrap,
-                    |s, v| s.soft_wrap = v,
-                    cx,
-                ),
-                toggle(
-                    "Line numbers",
-                    "Show numbers in the gutter.",
-                    s.line_numbers,
-                    |s, v| s.line_numbers = v,
-                    cx,
-                ),
-                toggle(
-                    "Indent guides",
-                    "Faint lines that follow indentation.",
-                    s.indent_guides,
-                    |s, v| s.indent_guides = v,
-                    cx,
-                ),
-                toggle(
-                    "Auto save",
-                    "Save files after a short pause in typing. Conflicting disk changes stay protected.",
-                    s.auto_save,
-                    |s, v| s.auto_save = v,
-                    cx,
-                ),
-                toggle(
-                    "Trim trailing whitespace",
-                    "Remove spaces at line ends when saving.",
-                    s.format_on_save_trim,
-                    |s, v| s.format_on_save_trim = v,
-                    cx,
-                ),
-                toggle(
-                    "Follow changes on disk",
-                    "Reload files and the review as agents edit them.",
-                    s.watch_files,
-                    |s, v| s.watch_files = v,
-                    cx,
-                ),
-                toggle(
-                    "Restore open files",
-                    "Reopen your tabs when you come back to a project.",
-                    s.restore_session,
-                    |s, v| s.restore_session = v,
+                group(
+                    "Saving",
+                    vec![
+                        toggle_hint(
+                            "Auto save",
+                            "Saves a moment after you stop typing.",
+                            s.auto_save,
+                            |s, v| s.auto_save = v,
+                            cx,
+                        ),
+                        toggle("Trim trailing whitespace", s.format_on_save_trim, |s, v| {
+                            s.format_on_save_trim = v
+                        }),
+                    ],
                     cx,
                 ),
             ],
-            Category::Terminal => vec![
-                heading("Terminal", cx),
-                row(
-                    "Default profile",
-                    "The shell new terminals open with. The menu beside + opens any other.",
-                    profile_picker(&s, cx),
-                    cx,
-                ),
-                row(
-                    "Custom command",
-                    "Adds a Custom profile. Quote paths that contain spaces.",
-                    div()
-                        .w(r(220.))
-                        .child(Input::new(&self.shell_input).small())
-                        .into_any_element(),
-                    cx,
-                ),
-                row(
-                    "Font size",
-                    "Terminal text size in points.",
-                    stepper(
-                        "term-size",
-                        format!("{}", s.terminal_font_size),
-                        |s| s.terminal_font_size -= 0.5,
-                        |s| s.terminal_font_size += 0.5,
+            Category::Terminal => vec![group(
+                "Shell",
+                vec![
+                    row("Default profile", profile_picker(&s, cx)),
+                    row_hint(
+                        "Custom command",
+                        "Quote paths that contain spaces.",
+                        div()
+                            .w(r(220.))
+                            .child(Input::new(&self.shell_input).small())
+                            .into_any_element(),
                         cx,
                     ),
-                    cx,
-                ),
-            ],
-            Category::Review => vec![
-                heading("Review", cx),
-                row(
-                    "Compare against",
-                    "Agents usually commit as they go, so the whole branch is the default.",
-                    segmented(
-                        "base",
-                        &[
-                            ("Base branch", ReviewBase::Branch),
-                            ("Uncommitted", ReviewBase::Uncommitted),
-                        ],
-                        s.review_base,
-                        |s, v| s.review_base = v,
-                        cx,
+                    row(
+                        "Font size",
+                        stepper(
+                            "term-size",
+                            format!("{}", s.terminal_font_size),
+                            |s| s.terminal_font_size -= 0.5,
+                            |s| s.terminal_font_size += 0.5,
+                            cx,
+                        ),
                     ),
-                    cx,
-                ),
-                row(
-                    "Layout",
-                    "Unified reads top to bottom; split shows before and after.",
-                    segmented(
-                        "layout",
-                        &[
-                            ("Unified", ReviewLayout::Unified),
-                            ("Split", ReviewLayout::Split),
-                        ],
-                        s.review_layout,
-                        |s, v| s.review_layout = v,
-                        cx,
-                    ),
-                    cx,
-                ),
-            ],
-            Category::Shortcuts => {
-                let mut rows = vec![heading("Keyboard shortcuts", cx)];
-                for (label, mac, other) in SHORTCUTS {
-                    rows.push(shortcut_row(label, shortcut(mac, other), cx));
-                }
-                rows
-            }
+                ],
+                cx,
+            )],
+            Category::Shortcuts => vec![group(
+                "",
+                SHORTCUTS
+                    .iter()
+                    .map(|(label, mac, other)| shortcut_row(label, shortcut(mac, other), cx))
+                    .collect(),
+                cx,
+            )],
             Category::About => vec![
-                heading("About", cx),
-                div()
-                    .pt(r(18.))
-                    .pb(r(16.))
-                    .child(super::about::identity(cx))
-                    .into_any_element(),
-                super::about::publisher(cx),
-                heading("Updates", cx),
-                toggle(
-                    "Automatic updates",
-                    "Check for new releases at startup and install them in the background.",
-                    s.auto_update,
-                    |s, v| s.auto_update = v,
+                about_header(cx),
+                group(
+                    "Updates",
+                    vec![
+                        update_row(cx),
+                        toggle_hint(
+                            "Update automatically",
+                            "Checks at launch and installs in the background.",
+                            s.auto_update,
+                            |s, v| s.auto_update = v,
+                            cx,
+                        ),
+                    ],
                     cx,
                 ),
-                heading("Resources", cx),
-                div()
-                    .pt(r(12.))
-                    .child(super::about::resources(cx))
-                    .into_any_element(),
-                row(
-                    "Startup log",
-                    "Launch timings and update diagnostics.",
-                    Button::new("about-startup-log")
-                        .outline()
-                        .small()
-                        .label("Open log")
-                        .on_click(|_, _, _| {
-                            if let Some(dir) = crate::settings::config_dir() {
-                                let _ = open::that(dir.join("startup.log"));
-                            }
-                        })
-                        .into_any_element(),
+                group(
+                    "Links",
+                    vec![
+                        link_row("Source code", "GitHub", brand::REPOSITORY.to_owned()),
+                        link_row(
+                            "Release notes",
+                            "Releases",
+                            format!("{}/releases", brand::REPOSITORY),
+                        ),
+                        link_row(
+                            brand::PUBLISHER,
+                            brand::PUBLISHER_URL
+                                .trim_start_matches("https://")
+                                .trim_start_matches("http://"),
+                            brand::PUBLISHER_URL.to_owned(),
+                        ),
+                        row(
+                            "Startup log",
+                            Button::new("about-startup-log")
+                                .outline()
+                                .small()
+                                .label("Open")
+                                .on_click(|_, _, _| {
+                                    if let Some(dir) = crate::settings::config_dir() {
+                                        let _ = open::that(dir.join("startup.log"));
+                                    }
+                                })
+                                .into_any_element(),
+                        ),
+                    ],
                     cx,
                 ),
                 div()
-                    .pt(r(8.))
                     .text_size(r(11.5))
                     .text_color(cx.theme().muted_foreground)
                     .child("Built with Rust and GPUI · MIT license")
                     .into_any_element(),
             ],
         }
+    }
+
+    /// Installed monospace families in a menu, the platform default first.
+    fn font_picker(&self, settings: &Settings, cx: &App) -> AnyElement {
+        let default: SharedString = format!("Default ({})", crate::theme::mono_font("", cx)).into();
+        let current = settings.editor_font_family.trim().to_owned();
+        let label: SharedString = if current.is_empty() {
+            default.clone()
+        } else {
+            current.clone().into()
+        };
+        let fonts = self.fonts.clone();
+        Button::new("editor-font")
+            .outline()
+            .small()
+            .min_w(r(180.))
+            .max_w(r(260.))
+            .label(label)
+            .dropdown_caret(true)
+            .text_color(cx.theme().foreground)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
+                let height = px(320.).min(window.viewport_size().height - px(120.));
+                let mut menu = menu.min_w(px(220.)).max_h(height).scrollable(true).item(
+                    PopupMenuItem::new(default.clone())
+                        .checked(current.is_empty())
+                        .on_click(|_, _, cx| {
+                            Settings::update(cx, |s| s.editor_font_family.clear())
+                        }),
+                );
+                let Some(fonts) = &fonts else {
+                    return menu.separator().label("Looking for fonts…");
+                };
+                menu = menu.separator();
+                // A family typed into settings.json by hand stays selectable.
+                if !current.is_empty() && !fonts.iter().any(|f| f.eq_ignore_ascii_case(&current)) {
+                    menu = menu.item(PopupMenuItem::new(current.clone()).checked(true));
+                }
+                for font in fonts {
+                    let family = font.to_string();
+                    menu = menu.item(
+                        PopupMenuItem::new(font.clone())
+                            .checked(font.eq_ignore_ascii_case(&current))
+                            .on_click(move |_, _, cx| {
+                                let family = family.clone();
+                                Settings::update(cx, |s| s.editor_font_family = family);
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 }
 
@@ -444,66 +491,114 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn heading(text: &'static str, cx: &App) -> AnyElement {
+/// A titled, bordered block of rows separated by hairlines.
+fn group(title: &'static str, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let border = theme.border;
     v_flex()
-        .pt(r(20.))
-        .gap(r(10.))
+        .w_full()
+        .flex_none()
+        .gap(r(6.))
+        .when(!title.is_empty(), |group| {
+            group.child(
+                div()
+                    .px(r(2.))
+                    .text_size(r(12.))
+                    .font_medium()
+                    .text_color(theme.muted_foreground)
+                    .child(title),
+            )
+        })
         .child(
-            div()
-                .text_size(r(15.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(text),
+            v_flex()
+                .w_full()
+                .rounded(r(8.))
+                .border_1()
+                .border_color(border)
+                .bg(theme.background)
+                .overflow_hidden()
+                .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    div()
+                        .w_full()
+                        .when(ix > 0, |d| d.border_t_1().border_color(border.opacity(0.7)))
+                        .child(row)
+                })),
         )
-        .child(div().h_px().bg(cx.theme().border))
         .into_any_element()
 }
 
-fn row(
+fn row(label: impl Into<SharedString>, control: AnyElement) -> AnyElement {
+    h_flex()
+        .w_full()
+        .min_h(r(40.))
+        .px(r(12.))
+        .py(r(6.))
+        .gap(r(16.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(r(13.5))
+                .child(label.into()),
+        )
+        .child(div().flex_none().child(control))
+        .into_any_element()
+}
+
+/// A row whose label needs one short line of explanation.
+fn row_hint(
     label: &'static str,
-    description: &'static str,
+    hint: impl Into<SharedString>,
     control: AnyElement,
     cx: &App,
 ) -> AnyElement {
     h_flex()
         .w_full()
-        .py(r(10.))
-        .gap(r(24.))
+        .min_h(r(40.))
+        .px(r(12.))
+        .py(r(7.))
+        .gap(r(16.))
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .gap(r(2.))
-                .child(div().text_size(r(14.)).child(label))
+                .gap(r(1.))
+                .child(div().truncate().text_size(r(13.5)).child(label))
                 .child(
                     div()
-                        .text_size(r(12.5))
+                        .text_size(r(12.))
                         .text_color(cx.theme().muted_foreground)
-                        .child(description),
+                        .child(hint.into()),
                 ),
         )
-        .child(control)
+        .child(div().flex_none().child(control))
         .into_any_element()
 }
 
-fn toggle(
+fn switch(label: &'static str, value: bool, set: fn(&mut Settings, bool)) -> AnyElement {
+    Switch::new(SharedString::from(label))
+        .small()
+        .checked(value)
+        .on_click(move |checked, _, cx| {
+            let checked = *checked;
+            Settings::update(cx, |s| set(s, checked));
+        })
+        .into_any_element()
+}
+
+fn toggle(label: &'static str, value: bool, set: fn(&mut Settings, bool)) -> AnyElement {
+    row(label, switch(label, value, set))
+}
+
+fn toggle_hint(
     label: &'static str,
-    description: &'static str,
+    hint: &'static str,
     value: bool,
     set: fn(&mut Settings, bool),
     cx: &App,
 ) -> AnyElement {
-    row(
-        label,
-        description,
-        Switch::new(SharedString::from(label))
-            .checked(value)
-            .on_click(move |checked, _, cx| {
-                let checked = *checked;
-                Settings::update(cx, |s| set(s, checked));
-            })
-            .into_any_element(),
-        cx,
-    )
+    row_hint(label, hint, switch(label, value, set), cx)
 }
 
 fn stepper(
@@ -518,24 +613,24 @@ fn stepper(
     let button = |suffix: &'static str, icon: IconName, f: fn(&mut Settings)| {
         div()
             .id(SharedString::from(format!("{id}-{suffix}")))
-            .size(r(26.))
+            .size(r(22.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(r(5.))
+            .rounded(r(4.))
             .cursor_pointer()
+            .text_color(theme.muted_foreground)
             .hover(move |s| s.bg(hover))
-            .child(Icon::new(icon).size(r(14.)))
+            .child(Icon::new(icon).size(r(13.)))
             .on_click(move |_, _, cx| Settings::update(cx, f))
     };
     h_flex()
-        .gap(r(2.))
-        .p(r(2.))
-        .rounded(r(7.))
+        .p(r(1.))
+        .rounded(r(6.))
         .border_1()
         .border_color(theme.border)
         .child(button("down", IconName::Minus, down))
-        .child(div().w(r(52.)).text_center().text_size(r(13.)).child(value))
+        .child(div().w(r(48.)).text_center().text_size(r(13.)).child(value))
         .child(button("up", IconName::Plus, up))
         .into_any_element()
 }
@@ -552,18 +647,20 @@ fn segmented<T: Copy + PartialEq + 'static>(
     h_flex()
         .p(r(2.))
         .gap(r(2.))
-        .rounded(r(7.))
+        .rounded(r(6.))
         .bg(theme.list_hover)
         .children(options.iter().enumerate().map(|(ix, (label, value))| {
             let value = *value;
             let selected = value == current;
             div()
                 .id(SharedString::from(format!("{id}-{ix}")))
-                .px(r(10.))
-                .h(r(24.))
+                .px(r(9.))
+                .h(r(22.))
+                .min_w(r(28.))
                 .flex()
                 .items_center()
-                .rounded(r(5.))
+                .justify_center()
+                .rounded(r(4.))
                 .text_size(r(12.5))
                 .cursor_pointer()
                 .when(selected, |d| {
@@ -590,7 +687,7 @@ fn profile_picker(settings: &Settings, cx: &App) -> AnyElement {
     Button::new("terminal-profile")
         .outline()
         .small()
-        .min_w(r(160.))
+        .min_w(r(180.))
         .label(current.clone())
         .dropdown_caret(true)
         .text_color(cx.theme().foreground)
@@ -630,7 +727,7 @@ fn profile_picker(settings: &Settings, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// Theme cards with a miniature window drawn in each palette.
+/// Small swatches, each a miniature window drawn in its palette.
 fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
     let theme = cx.theme().clone();
     let swatch = |choice: ThemeChoice| -> (Hsla, Hsla, Hsla, Hsla) {
@@ -646,42 +743,36 @@ fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
             ThemeChoice::Black => (hex(0x000000), hex(0x080808), hex(0xD6D7DB), hex(0x252525)),
         }
     };
+    let window = |(bg, sidebar, ink, line): (Hsla, Hsla, Hsla, Hsla)| {
+        h_flex()
+            .size_full()
+            .bg(bg)
+            .child(div().w(r(16.)).h_full().bg(sidebar))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .p(r(6.))
+                    .gap(r(3.))
+                    .child(
+                        div()
+                            .h(r(3.))
+                            .w(r(22.))
+                            .rounded_full()
+                            .bg(ink.opacity(0.75)),
+                    )
+                    .child(div().h(r(3.)).w(r(30.)).rounded_full().bg(line))
+                    .child(
+                        div()
+                            .h(r(3.))
+                            .w(r(16.))
+                            .rounded_full()
+                            .bg(gpui_kit::rgb(0x2383E2)),
+                    ),
+            )
+    };
     let mini = |choice: ThemeChoice| {
-        let (bg, sidebar, ink, line) = swatch(choice);
-        let window = |bg: Hsla, sidebar: Hsla, ink: Hsla, line: Hsla| {
-            h_flex()
-                .size_full()
-                .bg(bg)
-                .child(
-                    v_flex()
-                        .w(r(30.))
-                        .h_full()
-                        .bg(sidebar)
-                        .p(r(5.))
-                        .gap(r(4.))
-                        .child(div().h(r(3.)).w(r(16.)).rounded_full().bg(ink.opacity(0.5)))
-                        .child(div().h(r(3.)).w(r(12.)).rounded_full().bg(ink.opacity(0.3)))
-                        .child(div().h(r(3.)).w(r(14.)).rounded_full().bg(ink.opacity(0.3))),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .p(r(7.))
-                        .gap(r(4.))
-                        .child(div().h(r(4.)).w(r(40.)).rounded_full().bg(ink.opacity(0.8)))
-                        .child(div().h(r(3.)).w(r(56.)).rounded_full().bg(line))
-                        .child(div().h(r(3.)).w(r(48.)).rounded_full().bg(line))
-                        .child(
-                            div()
-                                .h(r(3.))
-                                .w(r(30.))
-                                .rounded_full()
-                                .bg(gpui_kit::rgb(0x2383E2)),
-                        ),
-                )
-        };
         if choice == ThemeChoice::System {
-            let (dbg, dsb, dink, dline) = swatch(ThemeChoice::Dark);
+            // Half light, half dark.
             h_flex()
                 .size_full()
                 .child(
@@ -689,37 +780,39 @@ fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
                         .w_1_2()
                         .h_full()
                         .overflow_hidden()
-                        .child(window(bg, sidebar, ink, line)),
+                        .child(window(swatch(ThemeChoice::Light))),
                 )
                 .child(
                     div()
                         .w_1_2()
                         .h_full()
                         .overflow_hidden()
-                        .child(window(dbg, dsb, dink, dline)),
+                        .child(window(swatch(ThemeChoice::Dark))),
                 )
                 .into_any_element()
         } else {
-            window(bg, sidebar, ink, line).into_any_element()
+            window(swatch(choice)).into_any_element()
         }
     };
     h_flex()
-        .pt(r(14.))
-        .pb(r(6.))
-        .gap(r(12.))
+        .w_full()
+        .px(r(12.))
+        .py(r(12.))
+        .gap(r(10.))
         .flex_wrap()
         .children(ThemeChoice::ALL.into_iter().map(|choice| {
             let selected = choice == current;
             v_flex()
                 .id(SharedString::from(format!("theme-{}", choice.label())))
-                .gap(r(6.))
+                .gap(r(5.))
+                .items_center()
                 .cursor_pointer()
                 .on_click(move |_, _, cx| Settings::update(cx, |s| s.theme = choice))
                 .child(
                     div()
-                        .w(r(112.))
-                        .h(r(72.))
-                        .rounded(r(8.))
+                        .w(r(62.))
+                        .h(r(40.))
+                        .rounded(r(6.))
                         .overflow_hidden()
                         .border_2()
                         .border_color(if selected {
@@ -731,14 +824,18 @@ fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
                 )
                 .child(
                     div()
-                        .text_size(r(12.5))
+                        .text_size(r(11.5))
                         .text_color(if selected {
                             theme.foreground
                         } else {
                             theme.muted_foreground
                         })
                         .when(selected, |d| d.font_medium())
-                        .child(choice.label()),
+                        .child(if choice == ThemeChoice::System {
+                            "System"
+                        } else {
+                            choice.label()
+                        }),
                 )
         }))
         .into_any_element()
@@ -746,17 +843,113 @@ fn theme_picker(current: ThemeChoice, cx: &App) -> AnyElement {
 
 fn shortcut_row(label: &'static str, keys: &'static str, cx: &App) -> AnyElement {
     h_flex()
-        .py(r(8.))
-        .border_b_1()
-        .border_color(cx.theme().border.opacity(0.6))
-        .child(div().flex_1().text_size(r(13.5)).child(label))
+        .w_full()
+        .h(r(32.))
+        .px(r(12.))
+        .gap(r(16.))
+        .child(div().flex_1().truncate().text_size(r(13.)).child(label))
         .child(
             div()
+                .flex_none()
                 .text_size(r(12.5))
                 .text_color(cx.theme().muted_foreground)
                 .child(keys),
         )
         .into_any_element()
+}
+
+fn about_header(cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .w_full()
+        .flex_none()
+        .gap(r(12.))
+        .child(super::welcome::logo(r(40.), cx))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(r(2.))
+                .child(
+                    h_flex()
+                        .gap(r(8.))
+                        .child(
+                            div()
+                                .text_size(r(17.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(brand::NAME),
+                        )
+                        .child(
+                            div()
+                                .px(r(6.))
+                                .py(r(1.))
+                                .rounded(r(4.))
+                                .bg(theme.list_hover)
+                                .text_size(r(11.5))
+                                .text_color(theme.muted_foreground)
+                                .child(brand::VERSION),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(r(12.5))
+                        .text_color(theme.muted_foreground)
+                        .child(brand::TAGLINE),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The version, what the last check found, and the one action that fits it.
+fn update_row(cx: &App) -> AnyElement {
+    let state = UpdateState::get(cx);
+    let (label, enabled): (&'static str, bool) = match &state.phase {
+        Phase::Checking => ("Checking…", false),
+        Phase::Downloading { .. } => ("Downloading…", false),
+        Phase::Available {
+            installable: true, ..
+        } => ("Download and install", true),
+        Phase::Available { .. } => ("Open download page", true),
+        Phase::Ready { .. } if cfg!(target_os = "windows") => ("Quit to install", true),
+        Phase::Ready { .. } => ("Restart now", true),
+        Phase::Package { .. } => ("Install…", true),
+        Phase::Idle | Phase::UpToDate | Phase::Failed(_) => ("Check for updates", true),
+    };
+    let primary = matches!(
+        state.phase,
+        Phase::Available { .. } | Phase::Ready { .. } | Phase::Package { .. }
+    );
+    let phase = state.phase.clone();
+    let button = Button::new("check-for-updates")
+        .small()
+        .label(label)
+        .disabled(!enabled)
+        .map(|button| {
+            if primary {
+                button.primary()
+            } else {
+                button.outline()
+            }
+        })
+        .on_click(move |_, _, cx| match phase {
+            Phase::Available { .. } | Phase::Package { .. } => updater::install_available(cx),
+            Phase::Ready { .. } => updater::restart(cx),
+            _ => updater::check(cx),
+        });
+    row_hint("Version", state.status(), button.into_any_element(), cx)
+}
+
+fn link_row(label: &'static str, detail: &'static str, url: String) -> AnyElement {
+    row(
+        label,
+        Button::new(SharedString::from(format!("link-{label}")))
+            .ghost()
+            .small()
+            .label(detail)
+            .icon(Icon::new(Lucide::ExternalLink).size(r(13.)))
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element(),
+    )
 }
 
 impl Focusable for SettingsView {
@@ -769,6 +962,7 @@ impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let content = self.render_category(cx);
+        let category = self.category;
         let nav = Category::ALL.into_iter().map(|category| {
             let selected = category == self.category;
             super::NavRow::new(SharedString::from(category.label()), category.label())
@@ -789,11 +983,14 @@ impl Render for SettingsView {
                 }),
             )
             .child(
+                // Occluding keeps the wheel and the pointer off the page behind.
                 div()
                     .id("settings-backdrop")
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .bg(theme.overlay)
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)),
@@ -809,29 +1006,33 @@ impl Render for SettingsView {
                     .child(
                         h_flex()
                             .id("settings")
-                            .w(r(900.))
-                            .h(r(620.))
-                            .max_w(gpui_kit::relative(0.92))
+                            .occlude()
+                            .w(r(760.))
+                            .h(r(540.))
+                            .max_w(gpui_kit::relative(0.94))
                             .max_h(gpui_kit::relative(0.9))
-                            .rounded(r(12.))
+                            .rounded(r(10.))
                             .overflow_hidden()
                             .bg(theme.popover)
                             .border_1()
                             .border_color(theme.border)
                             .shadow_2xl()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .child(
                                 v_flex()
-                                    .w(r(220.))
+                                    .w(r(176.))
                                     .h_full()
                                     .flex_none()
                                     .bg(theme.sidebar)
-                                    .pt(r(14.))
+                                    .border_r_1()
+                                    .border_color(theme.border.opacity(0.7))
+                                    .pt(r(12.))
                                     .gap(r(1.))
                                     .child(
                                         div()
-                                            .px(r(16.))
-                                            .pb(r(10.))
+                                            .px(r(14.))
+                                            .pb(r(8.))
                                             .text_size(r(12.))
                                             .font_medium()
                                             .text_color(theme.muted_foreground)
@@ -841,20 +1042,52 @@ impl Render for SettingsView {
                             )
                             .child(
                                 v_flex()
-                                    .id("settings-content")
                                     .flex_1()
                                     .min_w_0()
                                     .h_full()
-                                    .px(r(40.))
-                                    .pb(r(32.))
-                                    .overflow_y_scroll()
-                                    .children(content),
-                            )
-                            .child(div().absolute().top(r(12.)).right(r(12.)).child(
-                                super::icon_button("settings-close", IconName::Close, cx).on_click(
-                                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)),
-                                ),
-                            )),
+                                    // The title stays put; only the rows scroll.
+                                    .child(
+                                        h_flex()
+                                            .flex_none()
+                                            .h(r(46.))
+                                            .pl(r(24.))
+                                            .pr(r(10.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_size(r(15.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(category.label()),
+                                            )
+                                            .child(
+                                                super::icon_button(
+                                                    "settings-close",
+                                                    IconName::Close,
+                                                    cx,
+                                                )
+                                                .on_click(cx.listener(|_, _, _, cx| {
+                                                    cx.emit(SettingsEvent::Close)
+                                                })),
+                                            ),
+                                    )
+                                    .child(
+                                        // One scroll position per category.
+                                        div()
+                                            .id(("settings-content", category as usize))
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .child(
+                                                v_flex()
+                                                    .w_full()
+                                                    .px(r(24.))
+                                                    .pt(r(2.))
+                                                    .pb(r(24.))
+                                                    .gap(r(18.))
+                                                    .children(content),
+                                            ),
+                                    ),
+                            ),
                     ),
             )
     }

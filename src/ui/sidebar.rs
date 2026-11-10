@@ -86,7 +86,7 @@ pub fn file_icon(path: &Path, cx: &App) -> Icon {
         .text_color(cx.theme().muted_foreground)
 }
 
-fn status_color(badge: &str, cx: &App) -> Hsla {
+pub fn status_color(badge: &str, cx: &App) -> Hsla {
     match badge {
         "A" => cx.theme().green,
         "D" => cx.theme().red,
@@ -122,7 +122,7 @@ pub fn render(
         .flex()
         .flex_none()
         .items_center()
-        .h(r(42.))
+        .h(r(38.))
         .pl(top_pad)
         .pr(r(8.))
         .child(div().flex_1())
@@ -652,7 +652,7 @@ fn render_tree_row(
     let row_el = h_flex()
         .id(("tree-row", ix))
         .w_full()
-        .h(r(27.))
+        .h(r(25.))
         .pl(r(8. + row.depth as f32 * 14.))
         .pr(r(8.))
         .gap(r(6.))
@@ -860,7 +860,7 @@ fn render_change_row(
     let row = h_flex()
         .id(("change", ix))
         .w_full()
-        .h(r(27.))
+        .h(r(25.))
         .px(r(8.))
         .gap(r(6.))
         .rounded(r(5.))

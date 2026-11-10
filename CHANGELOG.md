@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 (2026-11-10)
+
+- **Check for updates.** Settings > About has a Check for updates button, also in the app menu and the command palette. It reports whether a newer release is out, downloads it with a progress figure in the status bar, and offers Restart now when it is installed. Source builds are pointed at the release page instead. The automatic check at launch is unchanged and no longer shows a message when the network is down.
+- **Updating while Modo is open.** Modo notices when the app on disk is no longer the one that is running, whether the updater, an installer, or `scripts/install.sh` replaced it, and shows Restart to update in the status bar. Restarting asks about unsaved files first and reopens the new version. The Windows installer now waits for Modo to be closed instead of failing on a file that is in use, and relaunches Modo after an update you asked to restart for. `scripts/install.sh` swaps the app in place so there is never a moment without it.
+- **Edits survive any kind of quit.** With auto save on, unsaved edits are written when the app is quit from the Dock, at logout, or by an installer, which previously skipped the save prompt.
+- **Quicker auto save.** Files save a quarter of a second after you stop typing (was three quarters), and immediately when you switch tabs or leave the window. A save no longer triggers a re-index of the project, a refresh of the file tree, or a reload of the file it just wrote.
+- **An overview when no file is open.** The empty page now shows what the branch changed: files, lines added and removed, review progress, and the busiest files with a bar for the size and balance of each change. Click a file to jump to it in the review.
+- **Better markdown.** Markdown files open rendered, with the source one click away. Front matter appears as a small table, images beside the file load, links to project files open in Modo (with `#L12` line anchors) and other links open in the browser. Mermaid diagrams are drawn in the background instead of holding up the page.
+- **Tab bar.** A long row of tabs scrolls inside the bar instead of running over the terminal button, the active tab is always scrolled into view, and a menu at the end lists every open tab.
+- **Settings, redone.** Five short pages of grouped one-line rows with a title that stays put. The editor font is a menu of the installed monospace families. Scrolling works at any window size and no longer moves the page behind the dialog.
+- **Tidier interface.** Slightly smaller bars, rows, and controls throughout.
+- **Faster and lighter.** Launch no longer lists every installed font, which took about a tenth of a second, and the window is created while the launch request is still being read. Restoring a session reads only the tab you left on; the others load when first shown. With many tabs open, at most twelve keep their editor in memory and the rest are reread when you return to them (never a tab with unsaved edits). Checks for files changed on disk run off the UI thread and skip unchanged files without reading them. With auto save on, the review is re-read when it is next shown rather than after every pause in typing.
+
 ## 0.4.0 (2026-11-05)
 
 - JSON opens in a native expandable tree; CSV and TSV open in native tables with a header toggle, cell copying, and column pages for wide files. Source editing stays one click away.

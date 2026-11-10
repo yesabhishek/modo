@@ -77,12 +77,25 @@ pub fn appearance_changed(_appearance: WindowAppearance, window: &mut Window, cx
     }
 }
 
+/// Whether a family is installed, asked of the text system one name at a time.
+///
+/// Listing every installed font takes about a tenth of a second on macOS,
+/// which is too much for launch or for a theme switch. Resolving one name is
+/// cheap and cached: a family that is missing resolves to a fallback, which
+/// then reports a different name.
+fn is_installed(family: &str, cx: &App) -> bool {
+    let text_system = cx.text_system();
+    let id = text_system.resolve_font(&gpui_kit::font(family.to_owned()));
+    text_system
+        .get_font_for_id(id)
+        .is_some_and(|font| font.family.eq_ignore_ascii_case(family))
+}
+
 /// The user's family if installed, else the best monospace face on this platform.
 pub fn mono_font(preferred: &str, cx: &App) -> SharedString {
-    let installed = cx.text_system().all_font_names();
-    let has = |name: &str| installed.iter().any(|f| f.eq_ignore_ascii_case(name));
-    if !preferred.trim().is_empty() && has(preferred.trim()) {
-        return preferred.trim().to_owned().into();
+    let preferred = preferred.trim();
+    if !preferred.is_empty() && is_installed(preferred, cx) {
+        return preferred.to_owned().into();
     }
     let candidates: &[&str] = if cfg!(target_os = "macos") {
         &["SF Mono", "Menlo", "Monaco"]
@@ -99,7 +112,29 @@ pub fn mono_font(preferred: &str, cx: &App) -> SharedString {
     };
     candidates
         .iter()
-        .find(|name| has(name))
+        .find(|name| is_installed(name, cx))
         .map(|name| SharedString::from(*name))
         .unwrap_or_else(|| Theme::default().mono_font_family)
+}
+
+/// Installed monospace families, for the font menu in Settings.
+///
+/// Reads every font's header, so call it off the UI thread. The scan is not
+/// kept: holding all system fonts open would cost memory for a menu that is
+/// rarely opened. `installed` is the text system's own list, so every name
+/// returned is one the editor can actually use.
+pub fn monospace_families(installed: &[String]) -> Vec<String> {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    let mut families: Vec<String> = db
+        .faces()
+        .filter(|face| face.monospaced)
+        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        // Hidden system faces start with a dot; bitmap faces do not scale.
+        .filter(|name| !name.starts_with('.') && !name.contains("Bitmap"))
+        .filter(|name| installed.iter().any(|font| font.eq_ignore_ascii_case(name)))
+        .collect();
+    families.sort_by_key(|name| name.to_lowercase());
+    families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    families
 }

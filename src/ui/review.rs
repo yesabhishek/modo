@@ -72,6 +72,8 @@ pub struct Review {
     fingerprints: HashMap<String, String>,
     loading: bool,
     loaded: bool,
+    /// The working tree changed while the diff was not on screen.
+    stale: bool,
     error: Option<SharedString>,
     skipped: usize,
     generation: u64,
@@ -107,6 +109,7 @@ impl Review {
             fingerprints: HashMap::new(),
             loading: false,
             loaded: false,
+            stale: false,
             error: None,
             skipped: 0,
             generation: 0,
@@ -122,6 +125,11 @@ impl Review {
 
     pub fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    /// A diff is being read and none has arrived yet.
+    pub fn is_loading(&self) -> bool {
+        self.loading && self.files.is_empty()
     }
 
     pub fn files(&self) -> &[ReviewFile] {
@@ -195,8 +203,17 @@ impl Review {
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
-        if !self.loaded && !self.loading {
+        if (!self.loaded || self.stale) && !self.loading {
             self.reload(cx);
+        }
+    }
+
+    /// The working tree changed but nothing shows the diff right now: read it
+    /// again when it is next needed, instead of after every save.
+    pub fn mark_stale_later(&mut self) {
+        if self.loaded {
+            self.stale = true;
+            self.reload_task = None;
         }
     }
 
@@ -331,6 +348,7 @@ impl Review {
             return;
         }
         self.generation += 1;
+        self.stale = false;
         let generation = self.generation;
         let scope = self.effective_scope();
         let context = format!(
@@ -489,7 +507,7 @@ impl Review {
     }
 
     /// What the review shows, for the compare menu's button.
-    fn compare_label(&self) -> SharedString {
+    pub fn compare_label(&self) -> SharedString {
         match self.effective_scope() {
             ReviewScope::Branch(base) => format!("Since {base}").into(),
             ReviewScope::Commit(commit) => {

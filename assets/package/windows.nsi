@@ -5,6 +5,7 @@
 Unicode true
 !include "MUI2.nsh"
 !include "x64.nsh"
+!include "LogicLib.nsh"
 
 Name "Modo"
 OutFile "${OUTFILE}"
@@ -39,7 +40,31 @@ Function .onInit
   SetRegView 64
 FunctionEnd
 
+; Windows will not replace a program that is running, and a half-replaced
+; install is worse than none. Wait for Modo to be closed (it asks about unsaved
+; files itself) rather than ending it.
+Function WaitForModoToClose
+  retry:
+    IfFileExists "$INSTDIR\modo.exe" 0 done
+    ClearErrors
+    FileOpen $0 "$INSTDIR\modo.exe" a
+    IfErrors locked
+    FileClose $0
+    Goto done
+  locked:
+    ${If} ${Silent}
+      ; The in-app updater runs the installer only after Modo has exited;
+      ; anything else running silently should fail, not hang.
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Modo is open.$\r$\n$\r$\nClose every Modo window, then choose Retry to finish installing." IDRETRY retry
+    Abort
+  done:
+FunctionEnd
+
 Section "Install"
+  Call WaitForModoToClose
   SetOutPath "$INSTDIR"
   File "${STAGING}\modo.exe"
   ; Windows Terminal's ConPTY, which the integrated terminal prefers.

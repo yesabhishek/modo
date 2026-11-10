@@ -1,19 +1,31 @@
 # Performance
 
-Measured on an Apple M4 Pro, macOS 27.2, release build (`cargo build --release`), October 2026. Each run used `--temporary-session` defaults and was sampled with `footprint` and `ps`.
+Measured on an Apple M4 Pro, macOS 27.2, release build (`scripts/package-macos.sh`), November 2026. Each figure is the middle of three launches, sampled with `footprint` and `ps` a few seconds after launch.
 
-| Scenario | First frame | Physical footprint | RSS | Idle CPU (10 s) |
-| --- | --- | --- | --- | --- |
-| Small project, one file open | 0.44 s | 65 MB | 101 MB | 0.1% |
-| This repository, no file open | 0.30 s | 65 MB | 101 MB | 0.0% |
+| Scenario | First frame | Physical footprint | RSS |
+| --- | --- | --- | --- |
+| Small project, no file open | 0.35 s | 81 MB | 112 MB |
+| Saved session with 28 source files open | 0.31 s | 111 MB | 114 MB |
+
+The same two launches in 0.4.0 took 0.44 s and 0.44 s, and the session with 28 tabs used 239 MB. The difference comes from three changes: launch no longer lists every installed font, the window is created while the launch request is still being read, and a restored tab is only a path until it is shown.
+
+"First frame" is the first frame with the project in it, not the empty window that precedes it.
 
 | Artifact | Size |
 | --- | --- |
-| Release binary (arm64) | 48 MB |
-| macOS DMG (arm64) | 12.5 MB |
-| macOS ZIP (arm64) | 10.0 MB |
+| Release binary (arm64) | 51 MB |
+| macOS DMG (arm64) | 13.8 MB |
+| macOS ZIP (arm64) | 11.3 MB |
 
 Most of the binary is Tree-sitter grammar tables. They are memory-mapped and only paged in when a file of that language opens, so they cost disk space, not memory.
+
+## What keeps it light
+
+- At most twelve editors are mounted. Tabs beyond that keep their place in the bar and are read again when shown; a tab with unsaved edits is never unloaded.
+- A save does not re-index the project, refresh the file tree, or reload the tab that was saved.
+- The review diff is re-read when it is on screen, not after every change.
+- Checks for files changed on disk run off the UI thread, and a file whose size and time are unchanged is not read.
+- Mermaid diagrams are laid out and rasterised on a background thread.
 
 ## How to measure
 
@@ -27,4 +39,4 @@ Idle CPU should stay at zero: Modo only redraws on input, file changes, or termi
 
 ## Startup diagnostics
 
-Each normal launch writes its first-frame time to `startup.log` in Modo's configuration directory. The log rotates at 64 KiB, retaining `startup.previous.log`; temporary sessions do not write it. Saved files load on background threads and editors mount incrementally, so session restoration does not block the first frame on disk reads. Update checks start after the first frame and run in the background.
+Each normal launch writes its first-frame time to `startup.log` in Modo's configuration directory. The log rotates at 64 KiB, retaining `startup.previous.log`; temporary sessions do not write it. Session restoration reads only the active tab's file, on a background thread, so it does not block the first frame. Update checks start after the first frame and run in the background.

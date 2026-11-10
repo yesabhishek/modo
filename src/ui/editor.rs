@@ -34,6 +34,8 @@ pub struct FileTab {
     pub line_ending: LineEnding,
     pub bom: bool,
     pub fingerprint: blake3::Hash,
+    /// Size and time of the file when `fingerprint` was taken.
+    stamp: Option<document::Stamp>,
     pub dirty: bool,
     /// Bumps on every edit, so a save can tell whether it captured the latest text.
     pub version: u64,
@@ -48,6 +50,8 @@ pub struct FileTab {
     structured_view: Option<Entity<super::data_view::DataView>>,
     structured_version: Option<u64>,
     pub formatting: bool,
+    /// When this tab was last shown, by the workspace's activation counter.
+    pub last_shown: u64,
     /// The text last handed to the preview, and the edit version it came from.
     preview_text: Option<(u64, SharedString)>,
     applied: Option<Settings>,
@@ -63,7 +67,7 @@ pub struct SaveJob {
     version: u64,
 }
 
-pub type SaveResult = (u64, Result<blake3::Hash, String>);
+pub type SaveResult = (u64, Result<(blake3::Hash, Option<document::Stamp>), String>);
 
 impl SaveJob {
     pub fn run(self) -> SaveResult {
@@ -73,8 +77,50 @@ impl SaveJob {
             self.line_ending,
             self.bom,
             Some(self.expected),
-        );
+        )
+        .map(|hash| (hash, document::stamp(&self.path)));
         (self.version, result)
+    }
+}
+
+/// What a tab knew about its file when a disk check started.
+pub struct DiskProbe {
+    pub path: PathBuf,
+    fingerprint: blake3::Hash,
+    stamp: Option<document::Stamp>,
+    dirty: bool,
+}
+
+pub enum DiskState {
+    /// Same bytes as the tab has; only the stamp may have moved.
+    Unchanged(Option<document::Stamp>),
+    /// Different bytes, and the tab has unsaved edits: do not touch it.
+    Conflict,
+    Changed(Box<LoadedFile>),
+}
+
+impl DiskProbe {
+    /// Runs off the UI thread: a stat, a hash only if the stat moved, and a
+    /// full read only if the bytes really differ.
+    pub fn check(&self) -> Option<DiskState> {
+        let stamp = document::stamp(&self.path);
+        if stamp.is_some() && stamp == self.stamp {
+            return None;
+        }
+        let current = document::fingerprint(&self.path).ok()??;
+        if current == self.fingerprint {
+            return Some(DiskState::Unchanged(stamp));
+        }
+        if self.dirty {
+            return Some(DiskState::Conflict);
+        }
+        document::load(&self.path)
+            .ok()
+            .map(|file| DiskState::Changed(Box::new(file)))
+    }
+
+    pub fn fingerprint(&self) -> blake3::Hash {
+        self.fingerprint
     }
 }
 
@@ -102,7 +148,10 @@ impl FileTab {
             files::language_for(&file.path)
         };
         let structured_kind = Kind::for_path(&file.path);
-        let preview = structured_kind.is_some() && !file.text.is_empty();
+        // Documents and data open as a reader sees them; the source is one
+        // click away. An empty file is about to be written, so it opens as text.
+        let preview =
+            (structured_kind.is_some() || preview::is_markdown(language)) && !file.text.is_empty();
         let text = file.text;
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -141,6 +190,7 @@ impl FileTab {
             line_ending: file.line_ending,
             bom: file.bom,
             fingerprint: file.fingerprint,
+            stamp: file.stamp,
             dirty: false,
             version: 0,
             saving: None,
@@ -152,6 +202,7 @@ impl FileTab {
             structured_view: None,
             structured_version: None,
             formatting: false,
+            last_shown: 0,
             preview_text: None,
             applied: Some(settings),
             _subscription: subscription,
@@ -175,9 +226,6 @@ impl FileTab {
             return;
         }
         self.preview = !self.preview;
-        if self.preview && self.is_markdown() {
-            preview::warm_up();
-        }
         self.focus(window, cx);
     }
 
@@ -227,10 +275,10 @@ impl FileTab {
     pub fn apply_settings(&self, _settings: &Settings, _cx: &mut App) {}
 
     pub fn sync_settings(&mut self, window: &mut Window, cx: &mut App) {
-        let settings = Settings::get(cx).clone();
-        if self.applied.as_ref() == Some(&settings) {
+        if self.applied.as_ref() == Some(Settings::get(cx)) {
             return;
         }
+        let settings = Settings::get(cx).clone();
         self.editor.update(cx, |state, cx| {
             state.set_soft_wrap(settings.soft_wrap, window, cx);
             state.set_line_number(settings.line_numbers, window, cx);
@@ -274,12 +322,13 @@ impl FileTab {
         _cx: &mut App,
     ) -> Result<(), SharedString> {
         self.saving = None;
-        let hash = result.map_err(|error| {
+        let (hash, stamp) = result.map_err(|error| {
             self.auto_save_failed = Some(version);
             SharedString::from(error)
         })?;
         self.auto_save_failed = None;
         self.fingerprint = hash;
+        self.stamp = stamp;
         self.disk_changed = false;
         // Edits made while the save ran stay dirty.
         if self.version == version {
@@ -288,43 +337,95 @@ impl FileTab {
         Ok(())
     }
 
-    /// Pick up edits made outside Modo (an agent, a formatter, git checkout).
-    pub fn reload_if_changed(&mut self, window: &mut Window, cx: &mut App) {
-        if self.saving.is_some() {
-            return;
-        }
-        let Ok(Some(current)) = document::fingerprint(&self.path) else {
-            return;
-        };
-        if current == self.fingerprint {
-            return;
-        }
-        if self.dirty {
-            self.disk_changed = true;
-            return;
-        }
-        let Ok(file) = document::load(&self.path) else {
-            return;
-        };
-        self.fingerprint = file.fingerprint;
-        self.line_ending = file.line_ending;
-        self.bom = file.bom;
-        self.editor.update(cx, |state, cx| {
-            let position = state.cursor_position();
-            state.set_value(file.text, window, cx);
-            state.set_cursor_position(position, window, cx);
-        });
-        self.preview_text = None;
-        self.structured_version = None;
-        self.dirty = false;
-        self.disk_changed = false;
+    /// Nothing would be lost by dropping this tab's editor and reading the
+    /// file again later: no unsaved edits, no save or format in flight.
+    pub fn is_idle(&self) -> bool {
+        !self.dirty
+            && !self.disk_changed
+            && !self.formatting
+            && self.saving.is_none()
+            && self.auto_save_task.is_none()
     }
 
-    /// Throw away local edits and take the version on disk.
-    pub fn revert(&mut self, window: &mut Window, cx: &mut App) {
+    pub fn cursor(&self, cx: &App) -> Position {
+        self.editor.read(cx).cursor_position()
+    }
+
+    /// Put the cursor back where it was, without changing what the tab shows.
+    pub fn restore_view(
+        &mut self,
+        cursor: Position,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.preview = preview && (self.is_markdown() || self.structured_kind.is_some());
+        self.editor.update(cx, |state, cx| {
+            state.set_cursor_position(cursor, window, cx);
+        });
+    }
+
+    /// The file on disk is still exactly what this tab last loaded or saved.
+    pub fn matches_disk(&self) -> bool {
+        self.stamp.is_some() && document::stamp(&self.path) == self.stamp
+    }
+
+    /// Start a check for edits made outside Modo (an agent, a formatter, git
+    /// checkout). `None` while a save of this tab is in flight.
+    pub fn disk_probe(&self) -> Option<DiskProbe> {
+        if self.saving.is_some() {
+            return None;
+        }
+        Some(DiskProbe {
+            path: self.path.clone(),
+            fingerprint: self.fingerprint,
+            stamp: self.stamp,
+            dirty: self.dirty,
+        })
+    }
+
+    /// Apply what a probe found, unless the tab moved on while it ran.
+    pub fn apply_disk_state(
+        &mut self,
+        probed: blake3::Hash,
+        state: DiskState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.saving.is_some() || self.fingerprint != probed {
+            return;
+        }
+        match state {
+            DiskState::Unchanged(stamp) => self.stamp = stamp,
+            DiskState::Conflict => self.disk_changed = true,
+            // Typed into while the file was being read: keep the edits.
+            DiskState::Changed(_) if self.dirty => self.disk_changed = true,
+            DiskState::Changed(file) => {
+                let file = *file;
+                self.fingerprint = file.fingerprint;
+                self.stamp = file.stamp;
+                self.line_ending = file.line_ending;
+                self.bom = file.bom;
+                self.editor.update(cx, |state, cx| {
+                    let position = state.cursor_position();
+                    state.set_value(file.text, window, cx);
+                    state.set_cursor_position(position, window, cx);
+                });
+                self.preview_text = None;
+                self.structured_version = None;
+                self.dirty = false;
+                self.disk_changed = false;
+            }
+        }
+    }
+
+    /// Throw away local edits; the next disk check takes the version on disk.
+    pub fn discard_edits(&mut self) {
         self.dirty = false;
+        self.disk_changed = false;
+        self.auto_save_task = None;
         self.fingerprint = blake3::hash(b"");
-        self.reload_if_changed(window, cx);
+        self.stamp = None;
     }
 
     pub fn status_info(&self, cx: &App) -> StatusInfo {
@@ -398,10 +499,10 @@ impl FileTab {
             .child(
                 h_flex()
                     .flex_none()
-                    .h(r(30.))
-                    .px(r(16.))
+                    .h(r(28.))
+                    .px(r(14.))
                     .gap(r(6.))
-                    .text_size(r(12.5))
+                    .text_size(r(12.))
                     .text_color(theme.muted_foreground)
                     .child(h_flex().flex_1().min_w_0().gap(r(6.)).children(crumbs))
                     .when(self.structured_kind.is_some() && !previewing, |bar| {
@@ -495,7 +596,9 @@ impl FileTab {
                                     if let Some(ix) = this.tab_for_path(&path)
                                         && let Some(Tab::File(file)) = this.tabs.get_mut(ix)
                                     {
-                                        file.revert(window, cx);
+                                        file.discard_edits();
+                                        let only = std::iter::once(path.clone()).collect();
+                                        this.reload_clean_files(Some(&only), window, cx);
                                         cx.notify();
                                     }
                                 })),
@@ -511,7 +614,14 @@ impl FileTab {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .child(preview::body(scroll_id, text, cx))
+                        .child(preview::body(
+                            scroll_id,
+                            text,
+                            &self.path,
+                            root,
+                            cx.entity().downgrade(),
+                            cx,
+                        ))
                         .into_any_element(),
                     None => div()
                         .flex_1()

@@ -25,6 +25,8 @@ enum Step {
     Do(Action),
     /// Click at a point in window coordinates, as the pointer would.
     Click(f32, f32),
+    /// Turn the wheel by `dy` pixels over a point in window coordinates.
+    Scroll(f32, f32, f32),
     Key(&'static str),
     Input(&'static str),
     Wait(u64),
@@ -113,7 +115,7 @@ fn editing_smoke() -> Vec<Step> {
             file.editor
                 .update(cx, |editor, cx| editor.insert("first edit", window, cx));
         }),
-        Step::Wait(350),
+        Step::Wait(100),
         act(|ws, window, cx| {
             let file = ws.active_file().unwrap();
             assert!(file.dirty);
@@ -357,6 +359,176 @@ fn save_race_smoke() -> Vec<Step> {
     ]
 }
 
+fn loaded_tabs(ws: &Workspace) -> usize {
+    ws.tabs
+        .iter()
+        .filter(|tab| matches!(tab, Tab::File(_)))
+        .count()
+}
+
+/// Opens more files than stay mounted, in a disposable project, and checks
+/// that idle tabs give up their editor, come back when shown, and that a tab
+/// with unsaved edits is never unloaded.
+fn tabs_smoke() -> Vec<Step> {
+    const FILES: usize = crate::ui::workspace::LOADED_TABS + 8;
+    let mut steps = vec![
+        Step::Wait(900),
+        act(|ws, _, cx| {
+            Settings::update(cx, |s| {
+                s.auto_save = false;
+                s.watch_files = false;
+            });
+            let root = ws.root().unwrap().to_path_buf();
+            for ix in 0..FILES {
+                let name = format!("tab-{ix:02}.txt");
+                assert!(
+                    !root.join(&name).exists(),
+                    "Use an empty disposable project"
+                );
+                std::fs::write(root.join(name), format!("file {ix}\nsecond line\n")).unwrap();
+            }
+        }),
+    ];
+    for ix in 0..FILES {
+        steps.push(act(move |ws, window, cx| {
+            let path = ws.root().unwrap().join(format!("tab-{ix:02}.txt"));
+            ws.open_file(path, None, window, cx);
+        }));
+        steps.push(Step::Wait(120));
+        if ix == 0 {
+            // Unsaved work in the first tab: it must stay mounted throughout.
+            steps.push(Step::Input("unsaved "));
+            steps.push(Step::Wait(60));
+        }
+    }
+    steps.extend([
+        act(|ws, window, cx| {
+            assert_eq!(ws.tabs.len(), FILES);
+            assert_eq!(
+                loaded_tabs(ws),
+                crate::ui::workspace::LOADED_TABS,
+                "idle tabs beyond the limit are unloaded"
+            );
+            let Tab::File(first) = &ws.tabs[0] else {
+                panic!("a tab with unsaved edits was unloaded")
+            };
+            assert!(first.dirty);
+            assert!(first.editor.read(cx).value().starts_with("unsaved "));
+            assert!(matches!(ws.tabs[1], Tab::Pending(_)));
+            // Showing an unloaded tab reads its file again.
+            ws.activate(1, window, cx);
+        }),
+        Step::Wait(400),
+        act(|ws, _, cx| {
+            let Tab::File(second) = &ws.tabs[1] else {
+                panic!("an unloaded tab did not come back when shown")
+            };
+            assert_eq!(
+                second.editor.read(cx).value().as_ref(),
+                "file 1\nsecond line\n"
+            );
+            assert_eq!(ws.active, Some(1));
+            assert!(loaded_tabs(ws) <= crate::ui::workspace::LOADED_TABS);
+            assert_eq!(ws.tabs.len(), FILES);
+            println!(
+                "tabs smoke: idle tabs unload, return when shown, and unsaved tabs stay mounted"
+            );
+        }),
+        Step::Shot(0),
+    ]);
+    steps
+}
+
+/// An agent edits an open file on disk: a clean tab follows it, a tab with
+/// unsaved edits keeps them and shows the conflict banner, and Modo's own
+/// saves are not mistaken for outside edits.
+fn follow_smoke() -> Vec<Step> {
+    vec![
+        Step::Wait(900),
+        act(|ws, window, cx| {
+            Settings::update(cx, |s| {
+                s.auto_save = true;
+                s.watch_files = true;
+            });
+            let path = crate::document::create(ws.root().unwrap(), "follow.txt").unwrap();
+            std::fs::write(&path, "first").unwrap();
+            ws.open_file(path, None, window, cx);
+        }),
+        Step::Wait(1200),
+        act(|ws, _, cx| {
+            let file = ws.active_file().expect("the file opened");
+            assert_eq!(file.editor.read(cx).value().as_ref(), "first");
+            std::fs::write(&file.path, "second, written by an agent").unwrap();
+        }),
+        Step::Wait(1200),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            assert_eq!(
+                file.editor.read(cx).value().as_ref(),
+                "second, written by an agent",
+                "a clean tab follows the file on disk"
+            );
+            assert!(!file.dirty && !file.disk_changed);
+            // Modo's own save must not come back as an outside change.
+            file.editor
+                .update(cx, |editor, cx| editor.insert("mine: ", window, cx));
+        }),
+        Step::Wait(1500),
+        act(|ws, window, cx| {
+            let file = ws.active_file().unwrap();
+            let text = file.editor.read(cx).value().to_string();
+            assert!(text.contains("mine: "), "own save kept the edit: {text:?}");
+            assert!(
+                !file.dirty && !file.disk_changed,
+                "own save is not a conflict"
+            );
+            assert_eq!(std::fs::read_to_string(&file.path).unwrap(), text);
+            // Now a real conflict: unsaved edits here, a different file there.
+            Settings::update(cx, |s| s.auto_save = false);
+            file.editor
+                .update(cx, |editor, cx| editor.insert("unsaved ", window, cx));
+            std::fs::write(&file.path, "third, from outside").unwrap();
+        }),
+        Step::Wait(1200),
+        act(|ws, _, cx| {
+            let file = ws.active_file().unwrap();
+            assert!(file.dirty && file.disk_changed, "the conflict is flagged");
+            assert!(file.editor.read(cx).value().contains("unsaved "));
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                "third, from outside"
+            );
+            println!(
+                "follow smoke: clean tabs follow the disk, own saves are quiet, conflicts are kept"
+            );
+        }),
+        Step::Shot(0),
+    ]
+}
+
+/// With a saved session (`MODO_CONFIG_DIR`), checks that launch mounts only
+/// the tab that was active and that the others load when first shown.
+fn restore_smoke() -> Vec<Step> {
+    vec![
+        Step::Wait(900),
+        act(|ws, window, cx| {
+            assert!(ws.tabs.len() >= 3, "the session's tabs are all in the bar");
+            assert_eq!(loaded_tabs(ws), 1, "only the active tab is read at launch");
+            let active = ws.active.expect("a tab is active");
+            assert!(matches!(ws.tabs[active], Tab::File(_)));
+            let other = (0..ws.tabs.len()).find(|ix| *ix != active).unwrap();
+            ws.activate(other, window, cx);
+        }),
+        Step::Wait(400),
+        act(|ws, _, _| {
+            assert_eq!(loaded_tabs(ws), 2);
+            assert!(matches!(ws.tabs[ws.active.unwrap()], Tab::File(_)));
+            println!("restore smoke: launch reads one file; the rest load when shown");
+        }),
+        Step::Shot(0),
+    ]
+}
+
 fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
     let want_preview = scene == "preview";
     let want_reviewed = scene == "review-progress";
@@ -413,6 +585,12 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
                     }
                 }
                 "settings" => ws.open_settings(window, cx),
+                "settings-editor" => {
+                    ws.open_settings(window, cx);
+                    if let Some(view) = ws.settings.clone() {
+                        view.update(cx, |view, cx| view.show_editor(cx));
+                    }
+                }
                 "new-file" => {
                     if let Some(root) = ws.root().map(std::path::Path::to_path_buf) {
                         ws.start_new_file(root, window, cx);
@@ -438,12 +616,48 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
                 session.recent = std::env::split_paths(&recent).collect();
                 cx.set_global(session);
             }
+            // `MODO_CAPTURE_UPDATE=available|downloading|ready` shows an update state.
+            if let Ok(state) = std::env::var("MODO_CAPTURE_UPDATE") {
+                use crate::updater::{Phase, UpdateState};
+                let version = "9.9.9".to_owned();
+                let phase = match state.as_str() {
+                    "available" => Phase::Available {
+                        version,
+                        url: crate::brand::REPOSITORY.to_owned(),
+                        installable: true,
+                    },
+                    "downloading" => Phase::Downloading {
+                        version,
+                        percent: Some(42),
+                    },
+                    "ready" => Phase::Ready {
+                        version: Some(version),
+                    },
+                    _ => Phase::UpToDate,
+                };
+                cx.set_global(UpdateState { phase });
+            }
             if std::env::var_os("MODO_CAPTURE_TERMINAL").is_some() {
                 ws.terminal.update(cx, |t, cx| t.show(window, cx));
             }
         }),
         Step::Wait(settle),
     ];
+    // `MODO_CAPTURE_OPEN_DIR=dir` opens every file in a folder, to fill the tab bar.
+    if let Some(dir) = std::env::var_os("MODO_CAPTURE_OPEN_DIR") {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        paths.retain(|path| path.is_file());
+        paths.sort();
+        for (ix, path) in paths.into_iter().enumerate() {
+            steps.insert(
+                1 + ix * 2,
+                act(move |ws, window, cx| ws.open_file(path, None, window, cx)),
+            );
+            steps.insert(2 + ix * 2, Step::Wait(120));
+        }
+    }
     if let Some(file) = file {
         steps.insert(
             1,
@@ -468,6 +682,13 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
             Step::Wait(400),
         ]);
     }
+    // `MODO_CAPTURE_SCROLL=x,y,dy` turns the wheel over a point before the shot.
+    if let Some(at) = std::env::var("MODO_CAPTURE_SCROLL").ok().and_then(|at| {
+        let mut parts = at.split(',').map(|part| part.trim().parse::<f32>().ok());
+        Some((parts.next()??, parts.next()??, parts.next()??))
+    }) {
+        steps.extend([Step::Scroll(at.0, at.1, at.2), Step::Wait(300)]);
+    }
     // `MODO_CAPTURE_CLICK=x,y` clicks a control, such as a menu, before the shot.
     if let Some((x, y)) = std::env::var("MODO_CAPTURE_CLICK").ok().and_then(|at| {
         let (x, y) = at.split_once(',')?;
@@ -483,6 +704,7 @@ fn single(scene: &str, file: Option<PathBuf>) -> Vec<Step> {
             act(|ws, window, cx| {
                 if let Some(ix) = ws.active
                     && let Some(Tab::File(file)) = ws.tabs.get_mut(ix)
+                    && !file.preview
                 {
                     file.toggle_preview(window, cx);
                 }
@@ -648,7 +870,7 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
         titlebar: Some(TitlebarOptions {
             title: Some(crate::brand::NAME.into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(15.), px(15.))),
+            traffic_light_position: Some(point(px(14.), px(13.))),
         }),
         ..TitleBar::window_options()
     };
@@ -668,6 +890,9 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
         _ if scene == "editing-smoke" => editing_smoke(),
         _ if scene == "data-smoke" => data_smoke(),
         _ if scene == "save-race-smoke" => save_race_smoke(),
+        _ if scene == "tabs-smoke" => tabs_smoke(),
+        _ if scene == "follow-smoke" => follow_smoke(),
+        _ if scene == "restore-smoke" => restore_smoke(),
         _ if scene == "live" => live(file.expect("MODO_CAPTURE_FILE")),
         _ => single(&scene, file),
     };
@@ -701,6 +926,29 @@ pub fn run(path: Option<PathBuf>, output: PathBuf, scene: String, cx: &mut App) 
                 Step::Click(x, y) => {
                     let _ = handle.update(cx, |_, window, cx| click(window, x, y, cx));
                     let _ = handle.update(cx, |_, window, cx| window.draw(cx).clear(cx));
+                }
+                Step::Scroll(x, y, dy) => {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let position = point(px(x), px(y));
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                        window.draw(cx).clear(cx);
+                        window.dispatch_event(
+                            PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                                position,
+                                delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(dy))),
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.draw(cx).clear(cx);
+                    });
                 }
                 Step::Do(f) => {
                     let _ = handle.update(cx, |_, window, cx| {

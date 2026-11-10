@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
@@ -19,8 +19,9 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions, PromptLevel, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, actions, deferred, div, prelude::FluentBuilder,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, UniformListScrollHandle, WeakEntity, Window, actions, deferred, div,
+    prelude::FluentBuilder,
 };
 
 use super::{
@@ -63,6 +64,7 @@ actions!(
         NextTab,
         PreviousTab,
         OpenSettings,
+        CheckForUpdates,
         ReviewChanges,
         ShowFiles,
         RefreshProject,
@@ -88,6 +90,14 @@ actions!(
 );
 
 const CONTEXT: &str = "Workspace";
+/// The pause in typing that triggers an automatic save.
+const AUTO_SAVE_DELAY: Duration = Duration::from_millis(250);
+/// Editors kept mounted. Each holds its text, undo history, and syntax tree;
+/// past this many, the tabs unused longest go back to being a path and are
+/// read again when next shown.
+pub const LOADED_TABS: usize = 12;
+/// How long a save's own file events are recognised as its echo.
+const SAVE_ECHO: Duration = Duration::from_secs(3);
 
 pub fn init(cx: &mut App) {
     super::data_view::init(cx);
@@ -160,6 +170,24 @@ pub fn init(cx: &mut App) {
         // Reached only when no window is focused (all windows closed on macOS).
         prompt_open_folder_new_window(cx);
     });
+    // The Dock's Quit, a logout, or an installer closing the app does not go
+    // through `quit` and its prompts. With auto save on, edits still reach
+    // the disk; either way the session is remembered.
+    cx.on_app_quit(|cx| {
+        for window in cx.windows() {
+            let _ = window.update(cx, |root, _, cx| {
+                if let Some(workspace) = root
+                    .downcast::<gpui_kit::base::Root>()
+                    .ok()
+                    .and_then(|root| root.read(cx).view().clone().downcast::<Workspace>().ok())
+                {
+                    workspace.update(cx, |workspace, cx| workspace.save_before_exit(cx));
+                }
+            });
+        }
+        async {}
+    })
+    .detach();
 }
 
 fn prompt_open_folder_new_window(cx: &mut App) {
@@ -180,10 +208,10 @@ fn prompt_open_folder_new_window(cx: &mut App) {
 }
 
 /// Close every window; each one asks about its own unsaved files first.
-fn quit(cx: &mut App) {
+pub fn quit(cx: &mut App) {
     let windows = cx.windows();
     if windows.is_empty() {
-        cx.quit();
+        crate::updater::finish_quit(cx);
         return;
     }
     cx.spawn(async move |cx| {
@@ -202,10 +230,11 @@ fn quit(cx: &mut App) {
                 .ok();
             let Some(proceed) = proceed else { continue };
             if !proceed.await {
+                crate::updater::cancel_restart();
                 return;
             }
         }
-        cx.update(|cx| cx.quit());
+        cx.update(crate::updater::finish_quit);
     })
     .detach();
 }
@@ -222,7 +251,28 @@ pub enum Panel {
 #[allow(clippy::large_enum_variant)]
 pub enum Tab {
     File(FileTab),
+    /// A file from the saved session that has not been shown yet. It is only
+    /// a path until its tab is first selected, so a session with many tabs
+    /// reads one file at launch instead of all of them.
+    Pending(PendingTab),
     Review,
+}
+
+pub struct PendingTab {
+    pub path: PathBuf,
+    /// A line to land on once the file has loaded.
+    line: Option<u32>,
+    /// Where the cursor was and whether the preview was showing, for a tab
+    /// that was unloaded to save memory.
+    view: Option<(gpui_kit::component::input::Position, bool)>,
+    loading: bool,
+}
+
+fn file_name(path: &Path) -> SharedString {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .into()
 }
 
 #[derive(Clone, Copy)]
@@ -243,6 +293,7 @@ impl Tab {
     fn target(&self) -> TabTarget {
         match self {
             Self::File(file) => TabTarget::File(file.path.clone()),
+            Self::Pending(pending) => TabTarget::File(pending.path.clone()),
             Self::Review => TabTarget::Review,
         }
     }
@@ -298,6 +349,8 @@ pub struct Workspace {
     pub project: Option<Project>,
     pub tabs: Vec<Tab>,
     pub active: Option<usize>,
+    /// Keeps the active tab in view when the bar holds more tabs than fit.
+    tab_scroll: ScrollHandle,
     pub sidebar_open: bool,
     pub sidebar_width: f32,
     pub panel: Panel,
@@ -315,6 +368,9 @@ pub struct Workspace {
     pub new_file: Option<NewFile>,
     /// Files the watcher saw change; reloaded on the next frame with a window.
     pending_reload: Option<HashSet<PathBuf>>,
+    /// Files Modo just wrote, so the watcher can tell its own saves from an
+    /// agent's edits and skip the reload, re-index, and tree refresh.
+    recent_saves: HashMap<PathBuf, Instant>,
     pub todos: Vec<crate::todos::Todo>,
     pub completed_todos: HashSet<String>,
     pub todo_filter: Option<String>,
@@ -326,6 +382,8 @@ pub struct Workspace {
     todo_task: Option<Task<()>>,
     pub window_color: Option<bool>,
     closing_tabs: bool,
+    /// The first window, drawn empty until launch knows which project to open.
+    launching: bool,
     save_prompts: usize,
     project_generation: u64,
     activation_generation: u64,
@@ -374,6 +432,13 @@ impl Workspace {
                 if window.is_window_active() {
                     this.refresh_git(cx);
                     this.reload_clean_files(None, window, cx);
+                    crate::updater::check_replaced(cx);
+                } else {
+                    // Leaving for another app (a terminal, an agent): have
+                    // everything on disk before it looks.
+                    for ix in 0..this.tabs.len() {
+                        this.flush_auto_save(ix, window, cx);
+                    }
                 }
             }),
         ];
@@ -413,8 +478,9 @@ impl Workspace {
             project: None,
             tabs: Vec::new(),
             active: None,
+            tab_scroll: ScrollHandle::new(),
             sidebar_open: true,
-            sidebar_width: 252.,
+            sidebar_width: 240.,
             panel: Panel::Files,
             tree: Tree::default(),
             git: GitState::default(),
@@ -429,6 +495,7 @@ impl Workspace {
             status: None,
             new_file: None,
             pending_reload: None,
+            recent_saves: HashMap::new(),
             todos: Vec::new(),
             completed_todos: HashSet::new(),
             todo_filter: None,
@@ -440,6 +507,7 @@ impl Workspace {
             todo_task: None,
             window_color: None,
             closing_tabs: false,
+            launching: false,
             save_prompts: 0,
             project_generation: 0,
             activation_generation: 0,
@@ -459,6 +527,26 @@ impl Workspace {
             });
         }
         this
+    }
+
+    /// The window opened at launch, before the project to show is decided.
+    pub fn launching(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(None, window, cx);
+        this.launching = true;
+        this
+    }
+
+    pub fn finish_launch(
+        &mut self,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.launching = false;
+        if let Some(path) = path {
+            self.open_path(path, window, cx);
+        }
+        cx.notify();
     }
 
     // ---- Project lifecycle -------------------------------------------------
@@ -570,6 +658,7 @@ impl Workspace {
             .iter()
             .filter_map(|tab| match tab {
                 Tab::File(file) => Some(file.path.clone()),
+                Tab::Pending(pending) => Some(pending.path.clone()),
                 Tab::Review => None,
             })
             .collect();
@@ -581,10 +670,13 @@ impl Workspace {
         let session = ProjectSession {
             root: project.root.clone(),
             open_files,
-            active_file: self
-                .restoring_active
-                .clone()
-                .or_else(|| self.active_file().map(|file| file.path.clone())),
+            active_file: self.restoring_active.clone().or_else(|| {
+                match self.tabs.get(self.active?)? {
+                    Tab::File(file) => Some(file.path.clone()),
+                    Tab::Pending(pending) => Some(pending.path.clone()),
+                    Tab::Review => None,
+                }
+            }),
             expanded: self
                 .tree
                 .expanded
@@ -933,10 +1025,34 @@ impl Workspace {
         });
     }
 
-    fn files_changed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn files_changed(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(root) = self.root().map(Path::to_path_buf) else {
             return;
         };
+        // A save writes a temporary file and renames it over the target. Those
+        // events are ours: nothing was created or removed, and the open tab
+        // already holds the new text.
+        self.recent_saves
+            .retain(|_, saved| saved.elapsed() < SAVE_ECHO);
+        if !self.recent_saves.is_empty() {
+            let saves = &self.recent_saves;
+            let tabs = &self.tabs;
+            paths.retain(|path| {
+                // Exact for the saved file: still what the tab wrote. An agent
+                // editing it a second later changes the stamp and is followed.
+                let unchanged = saves.contains_key(path)
+                    && tabs.iter().any(
+                        |tab| matches!(tab, Tab::File(file) if &file.path == path && file.matches_disk()),
+                    );
+                !unchanged && !is_save_temporary(path, saves)
+            });
+            if paths.is_empty() {
+                if self.todo_loaded || self.panel == Panel::Todos {
+                    self.start_todos(cx);
+                }
+                return;
+            }
+        }
         let mut dirs = HashSet::new();
         let mut git_changed = false;
         let mut worktree_changed = false;
@@ -995,7 +1111,7 @@ impl Workspace {
             if self.todo_loaded || self.panel == Panel::Todos {
                 self.start_todos(cx);
             }
-            self.review.update(cx, |review, cx| review.mark_stale(cx));
+            self.review_changed(cx);
             let changed: HashSet<PathBuf> = paths.into_iter().collect();
             self.pending_reload = Some(changed);
             cx.notify();
@@ -1003,6 +1119,30 @@ impl Workspace {
         if created_or_removed {
             self.start_index(cx);
         }
+    }
+
+    /// The diff is on screen: as the Review tab, the overview drawn when no
+    /// tab is open, or the change list in the sidebar.
+    fn review_visible(&self) -> bool {
+        self.panel == Panel::Changes
+            || matches!(
+                self.active.and_then(|ix| self.tabs.get(ix)),
+                Some(Tab::Review) | None
+            )
+    }
+
+    /// The working tree changed. Re-read the diff now if it is showing;
+    /// otherwise when it next is, so typing with auto save on does not run
+    /// Git after every pause.
+    fn review_changed(&mut self, cx: &mut Context<Self>) {
+        let visible = self.review_visible();
+        self.review.update(cx, |review, cx| {
+            if visible {
+                review.mark_stale(cx)
+            } else {
+                review.mark_stale_later()
+            }
+        });
     }
 
     pub fn start_todos(&mut self, cx: &mut Context<Self>) {
@@ -1066,15 +1206,17 @@ impl Workspace {
     // ---- Tabs --------------------------------------------------------------
 
     pub fn tab_for_path(&self, path: &Path) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|t| matches!(t, Tab::File(f) if f.path == path))
+        self.tabs.iter().position(|tab| match tab {
+            Tab::File(file) => file.path == path,
+            Tab::Pending(pending) => pending.path == path,
+            Tab::Review => false,
+        })
     }
 
     pub fn active_file(&self) -> Option<&FileTab> {
         match self.tabs.get(self.active?)? {
             Tab::File(file) => Some(file),
-            Tab::Review => None,
+            Tab::Pending(_) | Tab::Review => None,
         }
     }
 
@@ -1082,17 +1224,35 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
+        if let Some(previous) = self.active
+            && previous != ix
+        {
+            self.flush_auto_save(previous, window, cx);
+        }
         self.activation_generation += 1;
         self.active = Some(ix);
-        match &self.tabs[ix] {
+        self.tab_scroll.scroll_to_item(ix);
+        self.unload_idle_tabs(cx);
+        // The scroll lands during layout; draw once more so what depends on
+        // it (the tab list button) reflects the new position.
+        cx.on_next_frame(window, |_, _, cx| cx.notify());
+        let shown = self.activation_generation;
+        match &mut self.tabs[ix] {
             Tab::File(file) => {
                 let path = file.path.clone();
+                file.last_shown = shown;
                 file.focus(window, cx);
                 self.tree.selected = Some(path);
             }
+            Tab::Pending(pending) => {
+                self.tree.selected = Some(pending.path.clone());
+                self.load_pending(ix, window, cx);
+            }
             Tab::Review => {
-                self.review
-                    .update(cx, |review, cx| review.focus(window, cx));
+                self.review.update(cx, |review, cx| {
+                    review.ensure_loaded(cx);
+                    review.focus(window, cx)
+                });
             }
         }
         cx.notify();
@@ -1107,6 +1267,9 @@ impl Workspace {
     ) {
         let path = dunce::canonicalize(&path).unwrap_or(path);
         if let Some(ix) = self.tab_for_path(&path) {
+            if let (Some(line), Some(Tab::Pending(pending))) = (line, self.tabs.get_mut(ix)) {
+                pending.line = Some(line);
+            }
             self.activate(ix, window, cx);
             if let (Some(line), Some(Tab::File(file))) = (line, self.tabs.get_mut(ix)) {
                 file.go_to_line(line, window, cx);
@@ -1153,8 +1316,31 @@ impl Workspace {
         .detach();
     }
 
-    /// Read restored files off-thread, and mount one editor per frame so a
-    /// cold launch can paint and accept input before large sessions finish.
+    /// Follow a link from a rendered document to a file or folder.
+    pub fn open_linked(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        if path.is_file() {
+            self.open_file(path, line, window, cx);
+        } else if path.is_dir() {
+            self.sidebar_open = true;
+            self.panel = Panel::Files;
+            if !self.tree.expanded.contains(&path) {
+                self.toggle_dir(path.clone(), cx);
+            }
+            self.reveal(&path, cx);
+        } else {
+            self.notify_error(format!("{} does not exist.", path.display()), window, cx);
+        }
+    }
+
+    /// Put back the session's tabs without reading their files: each one is a
+    /// path until it is first shown, so launch reads only the tab left open.
     fn restore_files(
         &mut self,
         paths: Vec<PathBuf>,
@@ -1162,56 +1348,156 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Until the tabs exist, a session saved by another event keeps them.
         self.restoring_paths = paths.clone();
         self.restoring_active = active.clone();
         let generation = self.project_generation;
-        let mut expected_activation = self.activation_generation;
         self.restore_task = Some(cx.spawn_in(window, async move |this, cx| {
-            for path in paths {
-                let restoring_path = path.clone();
-                let loaded = cx
-                    .background_executor()
-                    .spawn(async move { crate::document::load(&path) })
-                    .await;
-                let proceed = this
-                    .update_in(cx, |this, window, cx| {
-                        if this.project_generation != generation {
-                            return false;
-                        }
-                        this.restoring_paths.retain(|path| path != &restoring_path);
-                        if let Ok(file) = loaded
-                            && this.tab_for_path(&file.path).is_none()
-                        {
-                            let preferred = active.as_ref() == Some(&file.path);
-                            let ix = this.tabs.len();
-                            let tab = FileTab::new(file, window, cx);
-                            this.tabs.push(Tab::File(tab));
-                            if this.activation_generation == expected_activation
-                                && (this.active.is_none() || preferred)
-                            {
-                                this.activate(ix, window, cx);
-                                expected_activation = this.activation_generation;
-                            }
-                            cx.notify();
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !proceed {
+            // Files deleted since the session was saved do not come back.
+            let existing = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter(|path| path.is_file())
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.project_generation != generation {
                     return;
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-            }
-            let _ = this.update(cx, |this, cx| {
-                if this.project_generation == generation {
-                    this.restoring_paths.clear();
-                    this.restoring_active = None;
-                    this.remember_session(cx);
+                this.restoring_paths.clear();
+                this.restoring_active = None;
+                for path in existing {
+                    if this.tab_for_path(&path).is_none() {
+                        this.tabs.push(Tab::Pending(PendingTab {
+                            path,
+                            line: None,
+                            view: None,
+                            loading: false,
+                        }));
+                    }
                 }
+                // Return to the tab the user left on, unless they have
+                // already opened something in the meantime.
+                if this.active.is_none() {
+                    let ix = active
+                        .and_then(|path| this.tab_for_path(&path))
+                        .or((!this.tabs.is_empty()).then_some(0));
+                    if let Some(ix) = ix {
+                        this.activate(ix, window, cx);
+                    }
+                }
+                this.remember_session(cx);
+                cx.notify();
             });
         }));
+    }
+
+    /// Keep at most `LOADED_TABS` editors mounted. The tabs stay in the bar;
+    /// the ones unused longest give up their editor and keep their place,
+    /// cursor, and preview state. Tabs with unsaved work are never unloaded.
+    fn unload_idle_tabs(&mut self, cx: &mut Context<Self>) {
+        let loaded = self
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab, Tab::File(_)))
+            .count();
+        if loaded <= LOADED_TABS {
+            return;
+        }
+        let mut idle: Vec<(u64, usize)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, tab)| match tab {
+                Tab::File(file) if Some(ix) != self.active && file.is_idle() => {
+                    Some((file.last_shown, ix))
+                }
+                _ => None,
+            })
+            .collect();
+        idle.sort_unstable();
+        for (_, ix) in idle.into_iter().take(loaded - LOADED_TABS) {
+            let Tab::File(file) = &self.tabs[ix] else {
+                continue;
+            };
+            let pending = PendingTab {
+                path: file.path.clone(),
+                line: None,
+                view: Some((file.cursor(cx), file.preview)),
+                loading: false,
+            };
+            self.tabs[ix] = Tab::Pending(pending);
+        }
+    }
+
+    /// Read a restored tab's file and mount its editor, the first time it is shown.
+    fn load_pending(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Pending(pending)) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        if pending.loading {
+            return;
+        }
+        pending.loading = true;
+        let path = pending.path.clone();
+        let generation = self.project_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = {
+                let path = path.clone();
+                cx.background_executor()
+                    .spawn(async move { crate::document::load(&path) })
+                    .await
+            };
+            let _ =
+                this.update_in(cx, |this, window, cx| {
+                    if this.project_generation != generation {
+                        return;
+                    }
+                    let Some(ix) = this.tabs.iter().position(
+                        |tab| matches!(tab, Tab::Pending(pending) if pending.path == path),
+                    ) else {
+                        return;
+                    };
+                    let (line, view) = match &this.tabs[ix] {
+                        Tab::Pending(pending) => (pending.line, pending.view),
+                        _ => (None, None),
+                    };
+                    match loaded {
+                        // The same file is already open under its canonical path.
+                        Ok(file)
+                            if this.tabs.iter().any(
+                                |tab| matches!(tab, Tab::File(open) if open.path == file.path),
+                            ) =>
+                        {
+                            this.remove_tab(ix, window, cx)
+                        }
+                        Ok(file) => {
+                            let mut tab = FileTab::new(file, window, cx);
+                            tab.last_shown = this.activation_generation;
+                            if let Some((cursor, preview)) = view {
+                                tab.restore_view(cursor, preview, window, cx);
+                            }
+                            if let Some(line) = line {
+                                tab.go_to_line(line, window, cx);
+                            }
+                            // Take the keyboard only if nothing else (the palette,
+                            // the terminal) took it while the file was read.
+                            if this.active == Some(ix) && this.focus.is_focused(window) {
+                                tab.focus(window, cx);
+                            }
+                            this.tabs[ix] = Tab::File(tab);
+                            this.unload_idle_tabs(cx);
+                        }
+                        // Deleted, or no longer readable as text.
+                        Err(_) => this.remove_tab(ix, window, cx),
+                    }
+                    cx.notify();
+                });
+        })
+        .detach();
     }
 
     pub fn close_tabs(
@@ -1457,6 +1743,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Save a tab now instead of waiting out its timer, when focus moves away.
+    fn flush_auto_save(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !Settings::get(cx).auto_save || self.closing_tabs || self.save_prompts > 0 {
+            return;
+        }
+        if let Some(Tab::File(file)) = self.tabs.get_mut(ix)
+            && file.auto_save_ready()
+        {
+            file.auto_save_task = None;
+            self.save_tab_impl(ix, false, true, window, cx);
+        }
+    }
+
     /// Each edit replaces its tab's timer; idle workspaces do no autosave polling.
     pub fn schedule_auto_save(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Tab::File(file)) = self.tabs.get_mut(ix) else {
@@ -1468,7 +1767,7 @@ impl Workspace {
         }
         let editor = file.editor.clone();
         file.auto_save_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(750)).await;
+            cx.background_executor().timer(AUTO_SAVE_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if !Settings::get(cx).auto_save { return; }
                 if let Some(ix) = this.tabs.iter().position(|tab| matches!(tab, Tab::File(file) if file.editor == editor && file.auto_save_ready())) {
@@ -1582,10 +1881,13 @@ impl Workspace {
                 }
                 match file.finish_save(result, cx) {
                     Ok(()) => {
+                        let (name, dirty) = (file.name(), file.dirty);
+                        this.recent_saves.insert(path.clone(), Instant::now());
+                        this.review_changed(cx);
                         if !automatic {
-                            this.status = Some(format!("Saved {}", file.name()).into());
+                            this.status = Some(format!("Saved {name}").into());
                         }
-                        if close_after && !file.dirty {
+                        if close_after && !dirty {
                             this.remove_tab(ix, window, cx);
                         } else {
                             this.schedule_auto_save(ix, window, cx);
@@ -1662,6 +1964,22 @@ impl Workspace {
         })
     }
 
+    /// The process is ending without having asked: write what auto save
+    /// would have written, and remember the session.
+    fn save_before_exit(&mut self, cx: &mut Context<Self>) {
+        if Settings::get(cx).auto_save {
+            for tab in &mut self.tabs {
+                if let Tab::File(file) = tab
+                    && file.auto_save_ready()
+                    && let Some(job) = file.begin_save(cx)
+                {
+                    let _ = file.finish_save(job.run(), cx);
+                }
+            }
+        }
+        self.remember_session(cx);
+    }
+
     /// Saves synchronously; used only when the window is about to go away.
     fn save_all_blocking(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut ok = true;
@@ -1691,19 +2009,55 @@ impl Workspace {
         ok
     }
 
+    /// Pick up files changed outside Modo. The stat, hash, and read happen off
+    /// the UI thread; a tab that moved on in the meantime is left alone.
     pub fn reload_clean_files(
         &mut self,
         only: Option<&HashSet<PathBuf>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for tab in &mut self.tabs {
-            if let Tab::File(file) = tab
-                && only.is_none_or(|set| set.contains(&file.path))
-            {
-                file.reload_if_changed(window, cx);
-            }
+        let probes: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::File(file) if only.is_none_or(|set| set.contains(&file.path)) => {
+                    file.disk_probe()
+                }
+                _ => None,
+            })
+            .collect();
+        if probes.is_empty() {
+            return;
         }
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    probes
+                        .into_iter()
+                        .filter_map(|probe| {
+                            let state = probe.check()?;
+                            Some((probe.path.clone(), probe.fingerprint(), state))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            if found.is_empty() {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (path, probed, state) in found {
+                    if let Some(ix) = this.tab_for_path(&path)
+                        && let Some(Tab::File(file)) = this.tabs.get_mut(ix)
+                    {
+                        file.apply_disk_state(probed, state, window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Close the window, asking about unsaved files first.
@@ -1788,7 +2142,7 @@ impl Workspace {
         match self.active.and_then(|ix| self.tabs.get(ix)) {
             Some(Tab::File(file)) => file.focus(window, cx),
             Some(Tab::Review) => self.review.update(cx, |r, cx| r.focus(window, cx)),
-            None => self.focus.focus(window, cx),
+            Some(Tab::Pending(_)) | None => self.focus.focus(window, cx),
         }
     }
 
@@ -1900,6 +2254,10 @@ impl Workspace {
         } else {
             r(8.)
         };
+        // Measured on the previous frame; `activate` asks for one more frame so
+        // the list button appears as soon as the tabs stop fitting.
+        let overflowing = self.tab_scroll.max_offset().x > gpui_kit::px(0.);
+        let tab_list = overflowing.then(|| self.render_tab_list(cx));
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let active = self.active == Some(ix);
             let (label, icon, dirty, tooltip): (
@@ -1914,6 +2272,13 @@ impl Workspace {
                     file.dirty,
                     self.root()
                         .map(|root| files::display_relative(root, &file.path).into()),
+                ),
+                Tab::Pending(pending) => (
+                    file_name(&pending.path),
+                    super::sidebar::file_icon(&pending.path, cx).into_any_element(),
+                    false,
+                    self.root()
+                        .map(|root| files::display_relative(root, &pending.path).into()),
                 ),
                 Tab::Review => (
                     "Review".into(),
@@ -1932,13 +2297,14 @@ impl Workspace {
                 .id(("tab", ix))
                 .group("tab")
                 .flex_none()
-                .h(r(28.))
-                .max_w(r(220.))
-                .pl(r(10.))
+                .h(r(26.))
+                .min_w(r(72.))
+                .max_w(r(190.))
+                .pl(r(9.))
                 .pr(r(4.))
                 .gap(r(6.))
                 .rounded(r(6.))
-                .text_size(r(13.))
+                .text_size(r(12.5))
                 .cursor_pointer()
                 .when(active, |t| {
                     t.bg(theme.list_active).text_color(theme.foreground)
@@ -1958,12 +2324,13 @@ impl Workspace {
                         gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                     })
                 })
-                .child(icon)
-                .child(div().truncate().child(label))
+                .child(div().flex_none().child(icon))
+                .child(div().flex_1().min_w_0().truncate().child(label))
                 .child(
                     div()
                         .id(("close", ix))
                         .flex()
+                        .flex_none()
                         .items_center()
                         .justify_center()
                         .size(r(18.))
@@ -2018,17 +2385,25 @@ impl Workspace {
         });
         let terminal_open = self.terminal.read(cx).open;
         TitleBar::new()
-            .h(r(42.))
+            .h(r(38.))
             .pl(left_pad)
             .pr(r(8.))
             .bg(theme.background)
             .border_color(gpui_kit::transparent_black())
             .child(
+                // An absolute zero basis keeps a long row of tabs from widening
+                // the bar (a percentage basis falls back to the content width
+                // when the bar is measured): the row takes the space left over
+                // and scrolls inside it.
                 h_flex()
-                    .flex_1()
+                    .w_0()
+                    .flex_grow(1.)
+                    .flex_shrink(1.)
+                    .flex_basis(gpui_kit::px(0.))
                     .min_w_0()
                     .h_full()
                     .gap(r(2.))
+                    .overflow_hidden()
                     .when(!self.sidebar_open, |bar| {
                         bar.child(
                             icon_button("open-sidebar", gpui_kit::assets::IconName::PanelLeft, cx)
@@ -2043,29 +2418,94 @@ impl Workspace {
                         h_flex()
                             .id("tabs")
                             .min_w_0()
+                            .h_full()
                             .gap(r(2.))
                             .overflow_x_scroll()
+                            .track_scroll(&self.tab_scroll)
                             .children(tabs),
                     ),
             )
             .child(
-                h_flex().flex_none().gap(r(2.)).child(
-                    icon_button("toggle-terminal", gpui_kit::assets::IconName::Terminal, cx)
-                        .when(terminal_open, |b| b.bg(cx.theme().list_active))
-                        .tooltip(|window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new("Terminal")
-                                .key_binding(gpui_kit::component::kbd::Kbd::binding_for_action(
-                                    &ToggleTerminal,
-                                    None,
-                                    window,
-                                ))
-                                .build(window, cx)
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.terminal.update(cx, |t, cx| t.toggle(window, cx))
-                        })),
-                ),
+                h_flex()
+                    .flex_none()
+                    .pl(r(6.))
+                    .gap(r(2.))
+                    .children(tab_list)
+                    .child(
+                        icon_button("toggle-terminal", gpui_kit::assets::IconName::Terminal, cx)
+                            .when(terminal_open, |b| b.bg(cx.theme().list_active))
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new("Terminal")
+                                    .key_binding(gpui_kit::component::kbd::Kbd::binding_for_action(
+                                        &ToggleTerminal,
+                                        None,
+                                        window,
+                                    ))
+                                    .build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.terminal.update(cx, |t, cx| t.toggle(window, cx))
+                            })),
+                    ),
             )
+            .into_any_element()
+    }
+
+    /// Every open tab in a menu, for when the bar holds more than it can show.
+    fn render_tab_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::{
+            Sizable as _, button::ButtonVariants as _, menu::DropdownMenu as _,
+        };
+        let workspace = cx.entity().downgrade();
+        gpui_kit::component::button::Button::new("tab-list")
+            .ghost()
+            .small()
+            .icon(
+                gpui_kit::component::Icon::new(IconName::ChevronDown)
+                    .size(r(14.))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .tooltip("Open tabs")
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, cx| {
+                let height =
+                    gpui_kit::px(420.).min(window.viewport_size().height - gpui_kit::px(96.));
+                let mut menu = menu
+                    .min_w(gpui_kit::px(240.))
+                    .max_w(gpui_kit::px(360.))
+                    .max_h(height)
+                    .scrollable(true);
+                let Some(this) = workspace.upgrade() else {
+                    return menu;
+                };
+                let this = this.read(cx);
+                for (ix, tab) in this.tabs.iter().enumerate() {
+                    let label: SharedString = match tab {
+                        Tab::File(FileTab { path, .. }) | Tab::Pending(PendingTab { path, .. }) => {
+                            match this.root() {
+                                Some(root) => files::display_relative(root, path).into(),
+                                None => file_name(path),
+                            }
+                        }
+                        Tab::Review => "Review".into(),
+                    };
+                    let target = tab.target();
+                    let workspace = workspace.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(this.active == Some(ix))
+                            .on_click(move |_, window, cx| {
+                                let _ = workspace.update(cx, |this, cx| {
+                                    if let Some(ix) =
+                                        this.tabs.iter().position(|tab| tab.target() == target)
+                                    {
+                                        this.activate(ix, window, cx);
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
             .into_any_element()
     }
 
@@ -2077,6 +2517,8 @@ impl Workspace {
         match self.active.and_then(|ix| self.tabs.get_mut(ix)) {
             Some(Tab::File(file)) => file.render(root.as_deref(), window, cx).into_any_element(),
             Some(Tab::Review) => self.review.clone().into_any_element(),
+            // Its file is being read; the editor replaces this within a frame or two.
+            Some(Tab::Pending(_)) => div().size_full().into_any_element(),
             None => super::welcome::render_empty_project(self, cx).into_any_element(),
         }
     }
@@ -2099,10 +2541,10 @@ impl Workspace {
         let limited = self.git.repo.as_ref().is_some_and(|r| r.limited);
         h_flex()
             .flex_none()
-            .h(r(26.))
+            .h(r(24.))
             .px(r(8.))
             .gap(r(2.))
-            .text_size(r(12.))
+            .text_size(r(11.5))
             .text_color(muted)
             .border_t_1()
             .border_color(theme.border)
@@ -2134,25 +2576,22 @@ impl Workspace {
             .child(div().flex_1())
             .when_some(
                 cx.try_global::<crate::updater::UpdateState>()
-                    .and_then(|state| state.message.clone()),
-                |bar, message| {
-                    let package = cx.global::<crate::updater::UpdateState>().package.clone();
+                    .and_then(|state| state.notice().map(|notice| (notice, state.phase.clone()))),
+                |bar, (notice, phase)| {
+                    use crate::updater::Phase;
+                    let actionable = !matches!(phase, Phase::Downloading { .. });
                     bar.child(
-                        div()
-                            .id("update-status")
+                        item("update-status")
                             .max_w(r(420.))
-                            .truncate()
-                            .px(r(6.))
-                            .child(message.clone())
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(message.clone())
-                                    .build(window, cx)
+                            .when(actionable, |item| {
+                                item.cursor_pointer().text_color(theme.primary).on_click(
+                                    move |_, _, cx| match phase {
+                                        Phase::Ready { .. } => crate::updater::restart(cx),
+                                        _ => crate::updater::install_available(cx),
+                                    },
+                                )
                             })
-                            .when_some(package, |item, package| {
-                                item.cursor_pointer().on_click(move |_, _, _| {
-                                    let _ = open::that(&package);
-                                })
-                            }),
+                            .child(div().truncate().child(notice)),
                     )
                 },
             )
@@ -2169,6 +2608,15 @@ impl Workspace {
             })
             .into_any_element()
     }
+}
+
+/// The temporary file a recent save wrote beside its target and has since
+/// renamed into place.
+fn is_save_temporary(path: &Path, saves: &HashMap<PathBuf, Instant>) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+        && saves.keys().any(|saved| saved.parent() == path.parent())
+        && !path.exists()
 }
 
 /// Cancels a background walk when its owning task is dropped.
@@ -2197,6 +2645,16 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.launching {
+            // A frame or two of plain background, rather than a welcome page
+            // that the restored project would immediately replace.
+            return div()
+                .id("workspace")
+                .size_full()
+                .bg(cx.theme().background)
+                .into_any_element();
+        }
+        // Timed from the first frame with content, not the placeholder above.
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             if std::env::var_os("MODO_LOG_STARTUP").is_some()
@@ -2214,6 +2672,7 @@ impl Render for Workspace {
             self.reload_clean_files(Some(&paths), window, cx);
         }
         let theme = cx.theme().clone();
+
         let terminal_maximized = self.terminal.read(cx).open && self.terminal.read(cx).maximized;
         let sidebar = (self.sidebar_open && !terminal_maximized)
             .then(|| super::sidebar::render(self, window, cx));
@@ -2371,6 +2830,16 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
+                // Show the result where the user can act on it.
+                if this.settings.is_none() {
+                    this.open_settings(window, cx);
+                }
+                if let Some(view) = this.settings.clone() {
+                    view.update(cx, |view, cx| view.show_about(cx));
+                }
+                crate::updater::check(cx);
+            }))
             .on_action(cx.listener(|this, _: &ReviewChanges, window, cx| {
                 this.sidebar_open = true;
                 this.panel = Panel::Changes;
@@ -2477,6 +2946,7 @@ impl Render for Workspace {
                     .with_priority(1),
                 )
             })
+            .into_any_element()
     }
 }
 

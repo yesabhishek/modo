@@ -19,10 +19,22 @@ case "$(uname -s)" in
     scripts/package-macos.sh
     apps=/Applications
     [[ -w "$apps" ]] || { apps="$HOME/Applications"; mkdir -p "$apps"; }
-    rm -rf "$apps/Modo.app"
-    cp -R dist/Modo.app "$apps/"
+    # Copy beside the old app, then swap with renames: there is never a moment
+    # without a Modo.app, and a Modo that is open keeps running from the bundle
+    # it started in until it is restarted.
+    staging="$apps/.Modo.app.installing"
+    previous="$apps/.Modo.app.previous"
+    rm -rf "$staging" "$previous"
+    cp -R dist/Modo.app "$staging"
+    [[ -d "$apps/Modo.app" ]] && mv "$apps/Modo.app" "$previous"
+    mv "$staging" "$apps/Modo.app"
+    rm -rf "$previous"
     echo "App:  $apps/Modo.app"
     link_cli "$apps/Modo.app/Contents/Resources/bin/modo"
+    if pgrep -f "/Modo.app/Contents/MacOS/modo" >/dev/null 2>&1; then
+      echo "Modo is open and still running the previous version."
+      echo "      Use \"Restart to update\" in its status bar, or quit and reopen it."
+    fi
     ;;
   Linux)
     cargo build --locked --release

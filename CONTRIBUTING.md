@@ -24,7 +24,7 @@ For visible changes, attach before and after screenshots. You can render them wi
 cargo run --features capture -- --capture shot.png --scene review path/to/repo
 ```
 
-Scenes: `new-file`, `editor`, `preview` (markdown, via `MODO_CAPTURE_FILE`), `review`, `review-split`, `palette`, `commands`, `search`, `settings`, `settings-terminal`, `about`, `settings-about`, `todos`, `review-progress`, `terminal-split`, `terminal-full`, `window-color`, `project-gradient`, `project-gradient-terminal`, `live`, and `tour` (writes a folder of frames for the README GIF). `MODO_CAPTURE_THEME=light|dark|paper|graphite|midnight|black` picks a theme. `MODO_CAPTURE_CLICK=x,y` clicks a point (window coordinates) before the shot, for example to open a menu.
+Scenes: `new-file`, `editor`, `preview` (markdown, via `MODO_CAPTURE_FILE`), `review`, `review-split`, `palette`, `commands`, `search`, `settings`, `settings-editor`, `settings-terminal`, `about`, `settings-about`, `todos`, `review-progress`, `terminal-split`, `terminal-full`, `window-color`, `project-gradient`, `project-gradient-terminal`, `live`, and `tour` (writes a folder of frames for the README GIF). `MODO_CAPTURE_THEME=light|dark|paper|graphite|midnight|black` picks a theme. `MODO_CAPTURE_CLICK=x,y` clicks a point (window coordinates) before the shot, for example to open a menu. `MODO_CAPTURE_SCROLL=x,y,dy` turns the wheel over a point, `MODO_CAPTURE_OPEN_DIR=folder` opens every file in a folder to fill the tab bar, `MODO_CAPTURE_SIZE=1100x700` sets the window size, and `MODO_CAPTURE_UPDATE=available|downloading|ready` shows an update state.
 
 ## Style
 
@@ -44,3 +44,7 @@ The project must not already contain `smoke.txt`. The scenario asserts disk cont
 The `data-smoke` scene creates `data-smoke.json` and `data-smoke.csv` in a disposable project and checks native search, lossless formatting, undo, and CSV autosave. Run it with a fresh project folder and `MODO_TEMPORARY_SESSION=1`.
 
 The `save-race-smoke` scene checks edits made during an in-flight save and autosave in background tabs. It creates `save-race.txt` and `other.txt` in a disposable project.
+
+The `follow-smoke` scene checks that a clean tab follows edits made on disk, that Modo's own saves are not treated as outside edits, and that a conflict keeps unsaved text. The `tabs-smoke` scene opens more files than stay mounted and checks that idle tabs unload, return when shown, and that a tab with unsaved edits stays. Both need a fresh project folder and `MODO_TEMPORARY_SESSION=1`.
+
+The `restore-smoke` scene checks that launch reads only the active tab's file. It needs a saved session: point `MODO_CONFIG_DIR` at a folder whose `session.json` lists the project with at least three open files, and do not set `MODO_TEMPORARY_SESSION`.

@@ -30,6 +30,23 @@ pub struct LoadedFile {
     pub line_ending: LineEnding,
     pub bom: bool,
     pub fingerprint: blake3::Hash,
+    pub stamp: Option<Stamp>,
+}
+
+/// Size and modification time: a cheap first test for "did this file change",
+/// so an unchanged file is not read and hashed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(Stamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
 }
 
 pub fn load(path: &Path) -> Result<LoadedFile, String> {
@@ -55,6 +72,12 @@ pub fn load(path: &Path) -> Result<LoadedFile, String> {
         return Err("Binary files are not supported.".into());
     }
     let fingerprint = blake3::hash(&bytes);
+    // Taken before the read: if the file changes in between, the stale stamp
+    // only costs one extra hash on the next check.
+    let stamp = metadata.modified().ok().map(|modified| Stamp {
+        len: metadata.len(),
+        modified,
+    });
     let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
     let raw = std::str::from_utf8(if bom { &bytes[3..] } else { &bytes }).map_err(|_| {
         "Only UTF-8 text files are supported; the file was not modified.".to_owned()
@@ -70,6 +93,7 @@ pub fn load(path: &Path) -> Result<LoadedFile, String> {
         line_ending,
         bom,
         fingerprint,
+        stamp,
     })
 }
 

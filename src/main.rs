@@ -29,8 +29,8 @@ use gpui_kit::component::{
     input::{Copy, Cut, Paste, Redo, SelectAll, Undo},
 };
 use gpui_kit::{
-    App, AppContext, Bounds, Menu, MenuItem, SystemMenuType, TitlebarOptions, WindowBounds,
-    WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Menu, MenuItem, SystemMenuType,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, point, px, size,
 };
 
 use settings::{Session, Settings};
@@ -87,6 +87,20 @@ fn parse_args() -> Option<Args> {
 }
 
 pub fn open_window(path: Option<PathBuf>, cx: &mut App) {
+    open_workspace(cx, |window, cx| Workspace::new(path, window, cx));
+}
+
+/// Open the first window before it is known what goes in it. Creating a
+/// window and its GPU surface takes longer than the wait for Finder's
+/// "open this folder" request, so the two overlap instead of adding up.
+fn open_launch_window(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
+    open_workspace(cx, Workspace::launching)
+}
+
+fn open_workspace(
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut Context<Workspace>) -> Workspace,
+) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
     let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -94,17 +108,14 @@ pub fn open_window(path: Option<PathBuf>, cx: &mut App) {
         titlebar: Some(TitlebarOptions {
             title: Some(brand::NAME.into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(15.), px(15.))),
+            traffic_light_position: Some(point(px(14.), px(13.))),
         }),
         app_id: Some(brand::BUNDLE_ID.to_owned()),
         ..TitleBar::window_options()
     };
-    let opened = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| Workspace::new(path, window, cx))
-    });
-    if let Err(error) = opened {
-        eprintln!("{}: cannot open a window: {error}", brand::SLUG);
-    }
+    gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| build(window, cx)))
+        .map_err(|error| eprintln!("{}: cannot open a window: {error}", brand::SLUG))
+        .ok()
 }
 
 fn menus() -> Vec<Menu> {
@@ -113,6 +124,7 @@ fn menus() -> Vec<Menu> {
             name: brand::NAME.into(),
             items: vec![
                 MenuItem::action(format!("About {}", brand::NAME), ws::About),
+                MenuItem::action("Check for Updates…", ws::CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", ws::OpenSettings),
                 MenuItem::separator(),
@@ -319,22 +331,33 @@ fn main() {
             return;
         }
         // Finder may launch us to open a folder; give that request a moment to
-        // arrive so we do not also restore the previous project.
+        // arrive so we do not also restore the previous project. The window
+        // is created meanwhile and filled in once the choice is made.
         let explicit = args.path.is_some();
+        let launch = open_launch_window(cx);
         cx.spawn(async move |cx| {
             use futures::StreamExt as _;
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(60))
-                .await;
             let first = if explicit {
                 None
             } else {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
                 open_rx.try_recv().ok()
             };
             cx.update(|cx| {
-                match first {
-                    Some(requested) => open_or_focus(requested, cx),
-                    None => open_window(path, cx),
+                let target = first.or(path);
+                let filled = launch.is_some_and(|(window, workspace)| {
+                    window
+                        .update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.finish_launch(target.clone(), window, cx)
+                            })
+                        })
+                        .is_ok()
+                });
+                if !filled {
+                    open_window(target, cx);
                 }
                 cx.activate(true);
             });

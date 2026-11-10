@@ -1,18 +1,20 @@
-//! Rendered markdown for `.md` files: clean prose, with mermaid diagrams
+//! Rendered markdown for `.md` files: clean prose, front matter as a small
+//! table, images and links resolved beside the file, and mermaid diagrams
 //! drawn natively (Mermaid to SVG, then SVG to a bitmap) in the app's colors.
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
 
 use gpui_kit::component::{
     ActiveTheme,
-    text::{MarkdownNode, TextView, TextViewStyle},
+    text::{FrontmatterPlugin, MarkdownExtensions, MarkdownNode, TextView, TextViewStyle},
 };
 use gpui_kit::{
-    App, Hsla, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, ParentElement, Rgba,
-    SharedString, Styled, StyledImage as _, div, img, px,
+    App, FontWeight, Hsla, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, ParentElement,
+    Rgba, SharedString, StyleRefinement, Styled, StyledImage as _, WeakEntity, div, img, px,
 };
 use markdown::mdast::Node;
 use mermaid_rs_renderer as mermaid;
@@ -32,34 +34,139 @@ pub fn is_markdown(language: &str) -> bool {
     language == "markdown"
 }
 
+/// Where a link in a document leads.
+#[derive(Debug, PartialEq)]
+enum LinkTarget {
+    /// Something for the browser or the mail client.
+    External(String),
+    /// A file in or beside the project, with an optional `#L12` line.
+    File(PathBuf, Option<u32>),
+    /// A heading in the same document.
+    Anchor,
+}
+
+/// Resolve a link the way a repository browser does: `/docs/a.md` from the
+/// project root, anything else from the folder of the document it is in.
+fn link_target(href: &str, document: &Path, root: Option<&Path>) -> LinkTarget {
+    let href = href.trim();
+    if href.starts_with('#') || href.is_empty() {
+        return LinkTarget::Anchor;
+    }
+    // `scheme:` before any slash: http, https, mailto, and the rest.
+    if let Some((scheme, _)) = href.split_once(':')
+        && !scheme.is_empty()
+        && !scheme.contains(['/', '.', '\\'])
+        && scheme.len() > 1
+    {
+        return LinkTarget::External(href.to_owned());
+    }
+    let (path, fragment) = match href.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (href, None),
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    let line = fragment
+        .and_then(|fragment| fragment.strip_prefix('L'))
+        .and_then(|line| line.split('-').next())
+        .and_then(|line| line.parse().ok());
+    LinkTarget::File(resolve(&percent_decode(path), document, root), line)
+}
+
+fn resolve(relative: &str, document: &Path, root: Option<&Path>) -> PathBuf {
+    match (relative.strip_prefix('/'), root) {
+        (Some(from_root), Some(root)) => root.join(from_root),
+        _ => document.parent().unwrap_or(Path::new(".")).join(relative),
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(hex) = text.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// The markdown body of a preview, ready to place in a scroll container.
-pub fn body(id: impl Into<SharedString>, text: SharedString, cx: &App) -> impl IntoElement {
+/// `document` is the file being shown: its images and links resolve from there.
+pub fn body(
+    id: impl Into<SharedString>,
+    text: SharedString,
+    document: &Path,
+    root: Option<&Path>,
+    workspace: WeakEntity<super::workspace::Workspace>,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme().clone();
     let id: SharedString = id.into();
+    let mut code_block = StyleRefinement::default();
+    code_block.text.font_size = Some(super::r(13.).into());
+    let table_head = StyleRefinement::default().font_weight(FontWeight::MEDIUM);
+    let image_document = document.to_path_buf();
+    let image_root = root.map(Path::to_path_buf);
+    let link_document = document.to_path_buf();
+    let link_root = root.map(Path::to_path_buf);
     div()
         .w_full()
-        .max_w(px(780.))
+        .max_w(px(760.))
         .mx_auto()
         .px(r(32.))
-        .pt(r(20.))
+        .pt(r(18.))
         .pb(r(80.))
         .text_size(r(15.))
+        .line_height(gpui_kit::relative(1.6))
         .text_color(theme.foreground)
         .child(
             TextView::markdown(id, text)
                 .selectable(true)
                 .style(
                     TextViewStyle::default()
-                        .paragraph_gap(gpui_kit::rems(0.9))
+                        .paragraph_gap(gpui_kit::rems(0.85))
                         .heading_font_size(|level, base| match level {
-                            1 => base * 2.0,
-                            2 => base * 1.55,
-                            3 => base * 1.25,
+                            1 => base * 1.9,
+                            2 => base * 1.45,
+                            3 => base * 1.2,
                             _ => base * 1.05,
-                        }),
+                        })
+                        .code_block(code_block)
+                        .table_head(table_head),
                 )
+                // A local picture is read from disk beside the document.
+                .image_source(move |uri| {
+                    match link_target(uri.as_ref(), &image_document, image_root.as_deref()) {
+                        LinkTarget::File(path, _) => ImageSource::from(path),
+                        // A web address is fetched as before.
+                        _ => ImageSource::from(uri.clone()),
+                    }
+                })
+                // Links to project files open in Modo; the rest go to the browser.
+                .on_link_click(move |href, _, window, cx| {
+                    match link_target(href, &link_document, link_root.as_deref()) {
+                        LinkTarget::External(url) => cx.open_url(&url),
+                        LinkTarget::Anchor => {}
+                        LinkTarget::File(path, line) => {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace.open_linked(path, line, window, cx)
+                            });
+                        }
+                    }
+                })
+                .markdown_extensions(MarkdownExtensions::default().frontmatter())
                 .markdown_block_parser(parse_block)
-                .markdown_block_renderer(BLOCK, render_block),
+                .markdown_block_renderer(BLOCK, render_block)
+                .plugin(FrontmatterPlugin::new()),
         )
 }
 
@@ -110,14 +217,14 @@ fn render_block(
         .rounded(r(8.))
         .border_1()
         .border_color(theme.border);
-    match render_cached(&source, &palette) {
-        Ok(bitmap) => frame.flex().justify_center().child(
+    match diagram(&source, palette, cx) {
+        Some(Ok(bitmap)) => frame.flex().justify_center().child(
             img(ImageSource::Image(bitmap.image))
                 .w(px(bitmap.width))
                 .max_w_full()
                 .object_fit(ObjectFit::Contain),
         ),
-        Err(message) => frame
+        Some(Err(message)) => frame
             .bg(theme.muted)
             .child(
                 div()
@@ -132,6 +239,18 @@ fn render_block(
                     .text_size(r(12.5))
                     .child(source),
             ),
+        // Still being drawn on a background thread.
+        None => frame
+            .h(r(120.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_size(r(12.5))
+                    .text_color(theme.muted_foreground)
+                    .child("Drawing diagram…"),
+            ),
     }
 }
 
@@ -144,27 +263,44 @@ struct Bitmap {
 
 type Rendered = Result<Bitmap, String>;
 
-fn cache() -> &'static Mutex<HashMap<u64, Rendered>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Rendered>>> = OnceLock::new();
+/// `None` marks a diagram that is being drawn.
+fn cache() -> &'static Mutex<HashMap<u64, Option<Rendered>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Option<Rendered>>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-fn render_cached(source: &str, palette: &Palette) -> Rendered {
+/// The finished diagram, or `None` while it is drawn off the UI thread.
+/// Layout, rasterising, and the first font scan can take a noticeable
+/// fraction of a second, which the page should not wait for.
+fn diagram(source: &SharedString, palette: Palette, cx: &mut App) -> Option<Rendered> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
     palette.hash(&mut hasher);
     let key = hasher.finish();
-    if let Some(found) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return found;
-    }
-    let rendered = rasterize(source, palette);
-    if let Ok(mut cache) = cache().lock() {
-        if cache.len() >= CACHE_LIMIT {
-            cache.clear();
+    {
+        let mut cache = cache().lock().ok()?;
+        if let Some(found) = cache.get(&key) {
+            return found.clone();
         }
-        cache.insert(key, rendered.clone());
+        if cache.len() >= CACHE_LIMIT {
+            // Keep the ones in flight: their tasks will fill them in.
+            cache.retain(|_, slot| slot.is_none());
+        }
+        cache.insert(key, None);
     }
-    rendered
+    let source = source.clone();
+    cx.spawn(async move |cx| {
+        let rendered = cx
+            .background_executor()
+            .spawn(async move { rasterize(&source, &palette) })
+            .await;
+        if let Ok(mut cache) = cache().lock() {
+            cache.insert(key, Some(rendered));
+        }
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
+    None
 }
 
 fn fonts() -> Arc<usvg::fontdb::Database> {
@@ -176,13 +312,6 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
             Arc::new(db)
         })
         .clone()
-}
-
-/// Load system fonts off the UI thread so the first diagram appears quickly.
-pub fn warm_up() {
-    std::thread::spawn(|| {
-        fonts();
-    });
 }
 
 fn rasterize(source: &str, palette: &Palette) -> Rendered {
@@ -324,6 +453,36 @@ mod tests {
         let white = gpui_kit::hsla(0., 0., 1., 1.);
         assert_eq!(hex(mix(black, white, 0.0)), "#ffffff");
         assert_eq!(hex(mix(black, white, 1.0)), "#000000");
+    }
+
+    #[test]
+    fn links_resolve_like_a_repository_browser() {
+        let document = Path::new("/project/docs/guide.md");
+        let root = Some(Path::new("/project"));
+        assert_eq!(
+            link_target("./api.md", document, root),
+            LinkTarget::File("/project/docs/./api.md".into(), None)
+        );
+        assert_eq!(
+            link_target("/src/main.rs#L42-L50", document, root),
+            LinkTarget::File("/project/src/main.rs".into(), Some(42))
+        );
+        assert_eq!(
+            link_target("My%20Notes.md?plain=1", document, root),
+            LinkTarget::File("/project/docs/My Notes.md".into(), None)
+        );
+        assert_eq!(link_target("#usage", document, root), LinkTarget::Anchor);
+        for url in ["https://example.com/a#b", "mailto:me@example.com"] {
+            assert_eq!(
+                link_target(url, document, root),
+                LinkTarget::External(url.into())
+            );
+        }
+        // A Windows drive letter is a path, not a URL scheme.
+        assert!(matches!(
+            link_target("C:/notes.md", document, None),
+            LinkTarget::File(..)
+        ));
     }
 
     #[test]

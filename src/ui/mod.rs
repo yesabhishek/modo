@@ -61,14 +61,14 @@ pub fn icon_button(id: impl Into<ElementId>, icon: impl IconNamed, cx: &App) -> 
         .flex_none()
         .items_center()
         .justify_center()
-        .size(r(26.))
+        .size(r(24.))
         .rounded(r(6.))
         .text_color(cx.theme().muted_foreground)
         .hover(move |s| s.bg(hover))
         .active(move |s| s.bg(active))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(Icon::new(icon).size(r(16.)))
+        .child(Icon::new(icon).size(r(15.)))
 }
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -124,18 +124,18 @@ impl RenderOnce for NavRow {
         };
         h_flex()
             .id(self.id)
-            .h(r(28.))
+            .h(r(26.))
             .mx(r(6.))
             .px(r(8.))
             .gap(r(8.))
             .rounded(r(6.))
-            .text_size(r(13.5))
+            .text_size(r(13.))
             .text_color(fg)
             .cursor_pointer()
             .when(self.selected, |row| row.bg(theme.list_active).font_medium())
             .when(!self.selected, |row| row.hover(move |s| s.bg(hover)))
             .when_some(self.icon, |row, icon| {
-                row.child(icon.size(r(16.)).text_color(theme.muted_foreground))
+                row.child(icon.size(r(15.)).text_color(theme.muted_foreground))
             })
             .child(div().flex_1().truncate().child(self.label))
             .when_some(self.trailing, |row, trailing| row.child(trailing))

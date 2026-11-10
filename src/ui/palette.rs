@@ -321,6 +321,13 @@ fn commands() -> Vec<Command> {
             "Ctrl+0",
             Lucide::Type,
         ),
+        c(
+            "Check for updates",
+            Box::new(ws::CheckForUpdates),
+            "",
+            "",
+            Lucide::RefreshCw,
+        ),
         c("About Modo", Box::new(ws::About), "", "", Lucide::CircleDot),
     ]
 }

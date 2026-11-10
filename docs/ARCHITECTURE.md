@@ -14,15 +14,21 @@ src/
   files.rs       Lazy directory reads, parallel ignore-aware file index
   search.rs      Project search (ripgrep crates) and fuzzy path ranking
   git.rs         Read-only Git: status, worktrees, review patches
-  capture.rs     Offscreen screenshots for docs (feature "capture")
+  structured.rs  JSON and CSV parsing and lossless formatting
+  todos.rs       TODO, FIXME, and friends, found in source comments
+  updater.rs     Release checks, downloads, installs, and restart
+  capture.rs     Offscreen screenshots and smoke tests (feature "capture")
   ui/
     workspace.rs Window root: project, tabs, file watching, actions
     sidebar.rs   Project switcher, navigation, file tree, search, changes
     editor.rs    An open file: editor state, saves, reloads
+    preview.rs   Rendered markdown and Mermaid diagrams
+    data_view.rs JSON tree and CSV table
     review.rs    Branch or uncommitted diff of the whole project
     terminal.rs  PTY sessions and the GPU-painted terminal grid
     palette.rs   Go to file, commands, line, and project switching
-    settings_view.rs, welcome.rs
+    welcome.rs   The first screen, and the change overview when no tab is open
+    settings_view.rs, about.rs
 ```
 
 ## Key decisions
@@ -33,4 +39,8 @@ src/
 - **Review is Git's view of the work.** `git diff <merge-base>` plus untracked files, parsed into one diff. Agents usually commit as they go, so branch review is the default; uncommitted-only is one click away.
 - **Follow the agent.** A recursive file watcher (FSEvents, inotify, ReadDirectoryChangesW) refreshes the tree, Git status, clean open files, and the review. Files with unsaved edits are never replaced; Modo shows a banner instead.
 - **Saves are safe.** Writes go to a temporary file beside the target, then replace it, only if the file on disk still matches what was loaded.
+- **A save is not an outside edit.** The watcher sees Modo's own saves too. A saved file whose size and time still match what the tab wrote, and the temporary file beside it, are ignored, so auto save does not re-index the project or reload the tab.
+- **Tabs are cheap until shown.** A tab restored from the session is only a path; its file is read and its editor mounted when the tab is first selected. At most twelve editors stay mounted: beyond that, the clean tabs unused longest go back to being a path, keeping their place, cursor, and preview state. A tab with unsaved edits is never unloaded.
+- **The diff is read when it is looked at.** Changes mark the review stale; it is re-read at once if the Review tab, the overview, or the change list is on screen, and otherwise when one of them next is.
+- **No font listing at launch.** Listing every installed family costs about a tenth of a second on macOS. The editor font is resolved by asking the text system for one name at a time; the full list is read on a background thread only when Settings is opened.
 - **Terminal.** alacritty_terminal runs the PTY and parses output; Modo paints the grid itself, one styled run per span. The shell starts at the panel's real size, as a direct login shell.

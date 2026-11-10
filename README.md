@@ -16,7 +16,9 @@ Agents like Claude Code, Codex, and Cursor write most of the code now. What you 
 
 - **Review agent work.** One scrollable diff of everything a branch changed since `main` (or any branch you pick), or only what is uncommitted. Unified or side by side, syntax highlighted, word-level changes marked. Switch between git worktrees in one click.
 - **Read and edit code.** Tree-sitter highlighting for over 25 languages, find and replace, multiple cursors, safe saves that never overwrite changes made on disk.
-- **Create and save files.** Use the Files toolbar or right-click a folder to create a file. Auto save saves after a short typing pause; turn it off in Settings > Editor when you prefer manual saves.
+- **Create and save files.** Use the Files toolbar or right-click a folder to create a file. Auto save writes a quarter of a second after you stop typing, and at once when you switch tabs or leave the window; turn it off in Settings > Editor when you prefer manual saves.
+- **Read documents.** Markdown opens rendered, with front matter, tables, task lists, local images, and Mermaid diagrams in the active theme. Links to project files open in Modo. `⌘⇧V` (Ctrl+Shift+V) switches to the source.
+- **See the branch at a glance.** With no file open, Modo shows what the branch changed: files, lines added and removed, review progress, and where the largest changes are.
 - **Follow along live.** Files, the tree, and the review refresh on their own while an agent edits.
 - **Inspect structured data.** JSON opens as an expandable tree and CSV/TSV as a table. Search keys, values, or cells with `⌘F` / `Ctrl+F`; use **Source** to edit and **Format** (Alt+Shift+F) to tidy the document. Formatting is undoable and preserves JSON number precision and duplicate keys, and CSV cell contents. Native rows are virtualized; parsing and search run in the background. Structured views support up to 10 MiB and 250,000 values, with source editing available when a preview exceeds the value limit.
 - **Find anything.** Fuzzy file search, project-wide search on ripgrep's engine, and a command palette.
@@ -46,7 +48,9 @@ xattr -dr com.apple.quarantine /Applications/Modo.app
 
 ### Updates
 
-Packaged installations check for a newer stable release in the background at startup and verify the download against its SHA-256 checksum. On macOS, updates replace the app bundle and take effect next launch; the previous bundle is restored if replacement fails. Windows waits until all Modo processes using the installation have exited, then runs the installer. Writable Linux installations replace the binary; protected system installations download a package and expose an install action in the status bar. Settings > About can disable automatic updates. Source builds and temporary sessions do not update themselves.
+Packaged installations check for a newer stable release in the background at startup and verify the download against its SHA-256 checksum. **Settings > About > Check for updates** (also in the app menu and the command palette) checks on demand, shows the download's progress, and offers **Restart now** once the new version is installed. On macOS, updates replace the app bundle; the previous bundle is restored if replacement fails. Windows waits until all Modo processes using the installation have exited, then runs the installer. Writable Linux installations replace the binary; protected system installations download a package and expose an install action in the status bar. Settings > About can disable automatic updates. Source builds are pointed at the release page instead of updating themselves.
+
+You can install a new version while Modo is open. The running copy notices that the app on disk changed and shows **Restart to update** in the status bar; it asks about unsaved files before it restarts. The Windows installer asks you to close Modo first.
 
 ### From source
 
@@ -63,7 +67,7 @@ git clone https://github.com/yesabhishek/modo.git && cd modo
 scripts/install.sh
 ```
 
-On macOS this puts `Modo.app` in Applications and a `modo` command on your PATH. On Windows, run `pwsh scripts/package-windows.ps1` (needs [NSIS](https://nsis.sourceforge.io)) and use the installer it writes to `dist\`.
+On macOS this puts `Modo.app` in Applications and a `modo` command on your PATH. Running it again updates the app in place, even while Modo is open. On Windows, run `pwsh scripts/package-windows.ps1` (needs [NSIS](https://nsis.sourceforge.io)) and use the installer it writes to `dist\`.
 
 ## Use it
 

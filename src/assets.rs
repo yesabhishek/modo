@@ -59,6 +59,11 @@ icon_assets!(
         Type,
         TextWrap,
         X,
+        RefreshCw,
+        Download,
+        Info,
+        FileClock,
+        GitCommitVertical,
     ]
 );
 
