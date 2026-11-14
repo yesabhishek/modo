@@ -63,7 +63,7 @@ image = { version = "0.25", default-features = false }
 markdown = "1.0"
 # Diagrams are drawn natively: Mermaid to SVG, then SVG to a bitmap with resvg.
 mermaid-rs-renderer = { version = "0.3", default-features = false }
-resvg = "0.46"
+resvg = "0.49"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 nucleo-matcher = "0.3"
 open = "5"
