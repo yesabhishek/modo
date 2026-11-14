@@ -49,7 +49,7 @@ fn action_row(
         .child(div().flex_1().text_size(r(14.)).child(label))
         .child(
             div()
-                .text_size(r(12.5))
+                .text_size(r(12.))
                 .text_color(theme.muted_foreground)
                 .child(keys),
         )
@@ -163,7 +163,7 @@ pub fn render(
                                     div()
                                         .flex_1()
                                         .truncate()
-                                        .text_size(r(12.5))
+                                        .text_size(r(12.))
                                         .text_color(theme.muted_foreground)
                                         .child(parent),
                                 )
@@ -195,6 +195,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
             .update(cx, |review, cx| review.ensure_loaded(cx));
     }
     let review = this.review.read(cx);
+    let summary = review.summary(cx);
     let compare = review.compare_label();
     let loading = review.is_loading();
     let mut files: Vec<_> = review.files().to_vec();
@@ -285,7 +286,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                     h_flex()
                         .h_full()
                         .w(gpui_kit::relative(share))
-                        .rounded(r(3.))
+                        .rounded(r(4.))
                         .overflow_hidden()
                         .bg(theme.red.opacity(0.75))
                         .child(
@@ -334,7 +335,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                     .text_color(theme.muted_foreground.opacity(0.8))
                     .child(keys),
             )
-            .child(div().text_size(r(12.5)).child(label))
+            .child(div().text_size(r(12.)).child(label))
     };
     let progress = if total == 0 {
         0.
@@ -356,7 +357,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(r(18.))
+                            .text_size(r(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(name),
                     )
@@ -366,7 +367,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                                 .flex_none()
                                 .max_w(r(240.))
                                 .gap(r(5.))
-                                .text_size(r(12.5))
+                                .text_size(r(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(Icon::new(Lucide::GitBranch).size(r(13.)))
                                 .child(div().truncate().child(branch)),
@@ -379,7 +380,7 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                         v_flex()
                             .gap(r(10.))
                             .p(r(12.))
-                            .rounded(r(10.))
+                            .rounded(r(8.))
                             .border_1()
                             .border_color(theme.border)
                             .child(
@@ -467,15 +468,26 @@ pub fn render_empty_project(this: &mut Workspace, cx: &mut Context<Workspace>) -
                             .px(r(8.))
                             .text_size(r(13.))
                             .text_color(theme.muted_foreground)
-                            .child(if loading {
-                                "Reading changes…".to_owned()
-                            } else if this.git.repo.is_some() {
-                                format!("Nothing to review. {compare}: no changes.")
+                            .child(if this.git.repo.is_none() {
+                                "This folder is not a Git repository.".into()
+                            } else if let Some(error) = summary.error.clone() {
+                                format!("Can't show changes. {error}").into()
+                            } else if loading {
+                                summary.label.clone()
                             } else {
-                                "This folder is not a Git repository.".to_owned()
+                                SharedString::from(format!("{compare}: no changes."))
                             }),
                     )
                 }
+            })
+            .when_some(summary.notice, |col, notice| {
+                col.child(
+                    div()
+                        .px(r(8.))
+                        .text_size(r(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(notice),
+                )
             })
             .child(
                 h_flex()

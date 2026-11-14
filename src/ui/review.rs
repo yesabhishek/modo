@@ -47,11 +47,17 @@ pub struct ReviewFile {
     pub badge: &'static str,
 }
 
+/// What the review shows, in words. The Review tab, the overview, and the
+/// Changes panel all read this, so they never disagree.
 pub struct Summary {
     pub label: SharedString,
     pub additions: usize,
     pub deletions: usize,
     pub loading: bool,
+    /// The diff could not be read.
+    pub error: Option<SharedString>,
+    /// Why the review shows something other than what was asked for.
+    pub notice: Option<SharedString>,
 }
 
 pub struct Review {
@@ -61,6 +67,9 @@ pub struct Review {
     base: Option<String>,
     /// A base the user picked for this project, overriding `base`.
     chosen: Option<String>,
+    /// The detected base turned out to share no history with this branch
+    /// (or no longer exists); uncommitted changes are shown instead.
+    fallback: Option<String>,
     /// Branches offered as bases, most recent first.
     branches: Vec<String>,
     commits: Vec<git::Commit>,
@@ -99,6 +108,7 @@ impl Review {
             repo: None,
             base: None,
             chosen: None,
+            fallback: None,
             branches: Vec::new(),
             commits: Vec::new(),
             commit: None,
@@ -164,6 +174,7 @@ impl Review {
         self.root = root;
         self.repo = None;
         self.base = None;
+        self.fallback = None;
         self.chosen = chosen;
         self.branches.clear();
         self.files.clear();
@@ -187,6 +198,7 @@ impl Review {
                     .await;
                 this.update(cx, |this, cx| {
                     this.base = base;
+                    this.fallback = None;
                     this.base_loading = false;
                     this.loading = false;
                     if this.loaded {
@@ -312,10 +324,11 @@ impl Review {
         // A base the user picked is used as is; the detected one is skipped on
         // the branch it names (main against origin/main shows nothing useful).
         let chosen = self.chosen.as_ref().filter(|b| **b != repo.branch);
-        let detected = self
-            .base
-            .as_ref()
-            .filter(|b| **b != repo.branch && !b.ends_with(&format!("/{}", repo.branch)));
+        let detected = self.base.as_ref().filter(|b| {
+            **b != repo.branch
+                && !b.ends_with(&format!("/{}", repo.branch))
+                && self.fallback.as_ref() != Some(*b)
+        });
         match chosen.or(detected) {
             Some(base) => ReviewScope::Branch(base.clone()),
             None => ReviewScope::Uncommitted,
@@ -351,6 +364,11 @@ impl Review {
         self.stale = false;
         let generation = self.generation;
         let scope = self.effective_scope();
+        // A base Modo picked (not the user) may fall back to uncommitted work.
+        let detected = match &scope {
+            ReviewScope::Branch(base) if self.chosen.as_ref() != Some(base) => Some(base.clone()),
+            _ => None,
+        };
         let context = format!(
             "{}:{scope:?}",
             self.repo
@@ -422,7 +440,13 @@ impl Review {
                         cx.emit(ReviewEvent::ProgressChanged);
                         this.settle_frames = 2;
                     }
-                    Err(error) => this.error = Some(error.into()),
+                    Err(error) => match detected {
+                        Some(base) if git::is_unusable_base(&error) => {
+                            this.fallback = Some(base);
+                            this.reload(cx);
+                        }
+                        _ => this.error = Some(error.into()),
+                    },
                 }
                 cx.notify();
             })
@@ -479,30 +503,33 @@ impl Review {
     pub fn summary(&self, _cx: &App) -> Summary {
         let additions = self.files.iter().map(|f| f.additions).sum();
         let deletions = self.files.iter().map(|f| f.deletions).sum();
-        let label: SharedString = if !self.loaded && !self.loading {
-            "Open Review to load the diff".into()
+        let label: SharedString = if self.error.is_some() {
+            "Can't show changes".into()
+        } else if !self.loaded && !self.loading {
+            "Not loaded yet".into()
         } else if self.files.is_empty() && self.loading {
-            "Loading changes…".into()
+            "Reading changes…".into()
         } else if self.files.is_empty() {
             "No changes".into()
         } else {
-            format!(
-                "{} {} changed · {} reviewed",
-                self.files.len(),
-                if self.files.len() == 1 {
-                    "file"
-                } else {
-                    "files"
-                },
-                self.files.iter().filter(|f| f.reviewed).count()
-            )
-            .into()
+            let reviewed = self.files.iter().filter(|f| f.reviewed).count();
+            let files = plural(self.files.len(), "file", "files");
+            if reviewed > 0 {
+                format!("{files} · {reviewed} reviewed").into()
+            } else {
+                files.into()
+            }
         };
         Summary {
             label,
             additions,
             deletions,
             loading: self.loading,
+            error: self.error.clone(),
+            notice: self.fallback.as_ref().map(|base| {
+                format!("Showing uncommitted changes: {base} shares no history with this branch.")
+                    .into()
+            }),
         }
     }
 
@@ -516,6 +543,11 @@ impl Review {
             ReviewScope::Uncommitted => "Uncommitted changes".into(),
         }
     }
+}
+
+/// `3 files`, `1 file`.
+pub fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 fn mode(layout: ReviewLayout) -> DiffMode {
@@ -598,53 +630,6 @@ fn compare_menu(
     }
 }
 
-/// A full-width row in the Changes panel that opens the compare menu.
-pub fn compare_picker(review: &Entity<Review>, cx: &App) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    let label = review.read(cx).compare_label();
-    let weak = review.downgrade();
-    div().px(r(6.)).pt(r(2.)).child(
-        Button::new("compare-picker")
-            .ghost()
-            .small()
-            .w_full()
-            .h(r(28.))
-            .px(r(8.))
-            .rounded(px(6.))
-            .tab_stop(false)
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap(r(8.))
-                    .text_size(r(13.))
-                    .child(
-                        Icon::new(Lucide::GitCompare)
-                            .size(r(15.))
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.sidebar_foreground)
-                            .child(label),
-                    )
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .size(r(14.))
-                            .text_color(theme.muted_foreground),
-                    ),
-            )
-            .dropdown_menu(compare_menu(weak.clone()))
-            .on_open_change(move |open, _, cx| {
-                if *open && let Some(review) = weak.upgrade() {
-                    review.update(cx, |review, cx| review.load_branches(cx));
-                }
-            }),
-    )
-}
-
 impl Focusable for Review {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -676,7 +661,7 @@ impl Render for Review {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(r(5.))
+                .rounded(r(6.))
                 .cursor_pointer()
                 .when(selected, |d| {
                     d.bg(theme.background)
@@ -735,7 +720,7 @@ impl Render for Review {
                     .child(
                         h_flex()
                             .gap(r(8.))
-                            .text_size(r(12.5))
+                            .text_size(r(12.))
                             .text_color(theme.muted_foreground)
                             .child(summary.label.clone())
                             .when(summary.additions > 0, |row| {
@@ -754,9 +739,12 @@ impl Render for Review {
                             })
                             .when(self.skipped > 0, |row| {
                                 row.child(format!(
-                                    "· {} large or extra untracked files hidden",
-                                    self.skipped
+                                    "· {} hidden (large or too many untracked)",
+                                    plural(self.skipped, "file", "files")
                                 ))
+                            })
+                            .when_some(summary.notice.clone(), |row, notice| {
+                                row.child(div().min_w_0().truncate().child(notice))
                             }),
                     ),
             )
@@ -765,7 +753,7 @@ impl Render for Review {
                 h_flex()
                     .p(r(2.))
                     .gap(r(2.))
-                    .rounded(r(7.))
+                    .rounded(r(6.))
                     .bg(theme.list_hover)
                     .child(segment(
                         "layout-unified",
@@ -888,7 +876,7 @@ impl Render for Review {
                                     .h(r(22.))
                                     .flex()
                                     .items_center()
-                                    .rounded(r(5.))
+                                    .rounded(r(6.))
                                     .text_size(r(12.))
                                     .text_color(cx.theme().muted_foreground)
                                     .cursor_pointer()

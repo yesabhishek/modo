@@ -28,10 +28,10 @@ use gpui_kit::{
 };
 
 use super::{
-    NavRow, drag_region, icon_button, is_mac, kbd, r, section_label, shortcut,
+    NavRow, drag_region, icon_button, is_mac, r, section_label,
     workspace::{
-        Dismiss, FindInFiles, OpenFolder, OpenSettings, Panel, QuickOpen, RefreshProject,
-        ReviewChanges, ShowFiles, ShowTodos, ToggleSidebar, ToggleWindowColor, Workspace,
+        Dismiss, FindInFiles, OpenFolder, OpenSettings, Panel, RefreshProject, ReviewChanges,
+        ShowFiles, ShowTodos, ToggleSidebar, ToggleWindowColor, Workspace,
     },
 };
 use crate::{
@@ -164,7 +164,7 @@ pub fn render(
                             .items_center()
                             .justify_center()
                             .size(r(22.))
-                            .rounded(r(5.))
+                            .rounded(r(6.))
                             .bg(this.project_color(cx).unwrap_or(theme.foreground))
                             .text_color(theme.background)
                             .text_size(r(12.))
@@ -213,7 +213,7 @@ pub fn render(
                     )
                     .separator()
                     .label("Recent folders");
-                for (ix, path) in recent.into_iter().filter(|path| path.is_dir()).enumerate() {
+                for (ix, path) in recent.into_iter().enumerate() {
                     let selected = current.as_ref() == Some(&path);
                     let name: SharedString = path
                         .file_name()
@@ -311,65 +311,94 @@ pub fn render(
             })
     };
 
-    let nav = v_flex()
+    // One quiet row of panel tabs instead of a stack of rows; the labels and
+    // shortcuts live in tooltips. Go to file stays a command (⌘P).
+    let tab = |id: &'static str,
+               icon: Lucide,
+               target: Panel,
+               label: &'static str,
+               action: Box<dyn gpui_kit::Action>,
+               cx: &mut Context<Workspace>| {
+        let selected = panel == target;
+        let hover = theme.list_hover;
+        let tip_action = action.boxed_clone();
+        h_flex()
+            .id(id)
+            .h(r(26.))
+            .px(r(7.))
+            .gap(r(4.))
+            .rounded(r(6.))
+            .cursor_pointer()
+            .text_size(r(11.5))
+            .when(selected, |t| {
+                t.bg(theme.list_active).text_color(theme.foreground)
+            })
+            .when(!selected, |t| {
+                t.text_color(theme.muted_foreground)
+                    .hover(move |s| s.bg(hover))
+            })
+            .child(Icon::new(icon).size(r(15.)))
+            .tooltip(move |window, cx| tooltip(label, tip_action.as_ref(), window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.panel == target && target != Panel::Files {
+                    this.panel = Panel::Files;
+                    cx.notify();
+                } else {
+                    window.dispatch_action(action.boxed_clone(), cx);
+                }
+            }))
+    };
+    let nav = h_flex()
         .flex_none()
+        .px(r(8.))
         .py(r(4.))
-        .gap(r(1.))
+        .gap(r(2.))
+        .child(tab(
+            "nav-files",
+            Lucide::ListTree,
+            Panel::Files,
+            "Files",
+            Box::new(ShowFiles),
+            cx,
+        ))
+        .child(tab(
+            "nav-search",
+            Lucide::TextSearch,
+            Panel::Search,
+            "Search",
+            Box::new(FindInFiles),
+            cx,
+        ))
         .child(
-            NavRow::new("nav-search", "Search")
-                .icon(Lucide::TextSearch)
-                .selected(panel == Panel::Search)
-                .trailing(kbd(shortcut("⌘⇧F", "Ctrl+Shift+F"), cx))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if this.panel == Panel::Search {
-                        this.panel = Panel::Files;
-                        cx.notify();
-                    } else {
-                        window.dispatch_action(Box::new(FindInFiles), cx);
-                    }
-                })),
+            tab(
+                "nav-review",
+                Lucide::GitCompare,
+                Panel::Changes,
+                "Review changes",
+                Box::new(ReviewChanges),
+                cx,
+            )
+            .when(review_count > 0, |t| {
+                t.child(
+                    div()
+                        .font_medium()
+                        .text_color(theme.yellow)
+                        .child(review_count.to_string()),
+                )
+            }),
         )
+        .child(tab(
+            "nav-todos",
+            Lucide::ListTodo,
+            Panel::Todos,
+            "To-dos",
+            Box::new(ShowTodos),
+            cx,
+        ))
+        .child(div().flex_1())
         .child(
-            NavRow::new("nav-goto", "Go to file")
-                .icon(Lucide::Command)
-                .trailing(kbd(shortcut("⌘P", "Ctrl+P"), cx))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(QuickOpen), cx)),
-        )
-        .child(
-            NavRow::new("nav-review", "Review changes")
-                .icon(Lucide::GitCompare)
-                .selected(panel == Panel::Changes)
-                .when(review_count > 0, |row| {
-                    row.trailing(
-                        div()
-                            .px(r(6.))
-                            .rounded(r(4.))
-                            .bg(theme.yellow_light)
-                            .text_color(theme.yellow)
-                            .text_size(r(11.5))
-                            .font_medium()
-                            .child(review_count.to_string()),
-                    )
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if this.panel == Panel::Changes {
-                        this.panel = Panel::Files;
-                        cx.notify();
-                    } else {
-                        window.dispatch_action(Box::new(ReviewChanges), cx);
-                    }
-                })),
-        )
-        .child(
-            NavRow::new("nav-todos", "To-dos")
-                .icon(Lucide::ListTodo)
-                .selected(panel == Panel::Todos)
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTodos), cx)),
-        )
-        .child(
-            NavRow::new("nav-settings", "Settings")
-                .icon(IconName::Settings)
-                .trailing(kbd(shortcut("⌘,", "Ctrl+,"), cx))
+            icon_button("nav-settings", IconName::Settings, cx)
+                .tooltip(|window, cx| tooltip("Settings", &OpenSettings, window, cx))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),
         );
 
@@ -395,7 +424,7 @@ pub fn render(
             Panel::Files => render_files(this, cx),
             Panel::Search => v_flex()
                 .size_full()
-                .child(panel_header("Search", [close_panel(cx)], cx))
+                .child(panel_header("Search", [], cx))
                 .child(div().flex_1().min_h_0().child(this.search.clone()))
                 .into_any_element(),
             Panel::Changes => render_changes(this, cx),
@@ -589,7 +618,7 @@ fn render_files(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement
             col.child(
                 div()
                     .px(r(14.))
-                    .text_size(r(12.5))
+                    .text_size(r(12.))
                     .text_color(cx.theme().red)
                     .child(error),
             )
@@ -656,8 +685,8 @@ fn render_tree_row(
         .pl(r(8. + row.depth as f32 * 14.))
         .pr(r(8.))
         .gap(r(6.))
-        .rounded(r(5.))
-        .text_size(r(13.5))
+        .rounded(r(6.))
+        .text_size(r(13.))
         .text_color(name_color)
         .when(row.ignored, |row| row.opacity(0.55))
         .cursor_pointer()
@@ -723,20 +752,16 @@ fn render_changes(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
         .map(|r| r.worktrees.clone())
         .unwrap_or_default();
     let root = this.root().map(Path::to_path_buf);
-    let branch = this.git.repo.as_ref().map(|r| r.branch.clone());
     let no_repo = this.git.repo.is_none();
 
     let mut col = v_flex().size_full().child(panel_header(
         "Changes",
-        [
-            icon_button("changes-refresh", IconName::RefreshCw, cx)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.refresh_git(cx);
-                    this.review.update(cx, |r, cx| r.reload(cx));
-                }))
-                .into_any_element(),
-            close_panel(cx),
-        ],
+        [icon_button("changes-refresh", IconName::RefreshCw, cx)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.refresh_git(cx);
+                this.review.update(cx, |r, cx| r.reload(cx));
+            }))
+            .into_any_element()],
         cx,
     ));
     if no_repo {
@@ -772,23 +797,9 @@ fn render_changes(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyEleme
             );
         }
         col = col.child(div().h(r(8.)));
-    } else if let Some(branch) = branch {
-        col = col.child(
-            h_flex()
-                .px(r(14.))
-                .h(r(26.))
-                .gap(r(6.))
-                .text_size(r(13.))
-                .text_color(theme.sidebar_foreground)
-                .child(
-                    Icon::new(Lucide::GitBranch)
-                        .size(r(14.))
-                        .text_color(theme.muted_foreground),
-                )
-                .child(div().truncate().child(branch)),
-        );
     }
-    col = col.child(super::review::compare_picker(&this.review, cx));
+    // The branch is in the status bar and what it is compared against is in
+    // the Review tab's header; the panel lists the files.
     col = col.child(
         h_flex()
             .px(r(14.))
@@ -863,7 +874,7 @@ fn render_change_row(
         .h(r(25.))
         .px(r(8.))
         .gap(r(6.))
-        .rounded(r(5.))
+        .rounded(r(6.))
         .text_size(r(13.))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
@@ -956,7 +967,7 @@ fn render_todos(this: &mut Workspace, cx: &mut Context<Workspace>) -> AnyElement
     let workspace = cx.entity().downgrade();
     v_flex().size_full()
         .child(panel_header("To-dos", [icon_button("todos-refresh", IconName::RefreshCw, cx)
-            .on_click(cx.listener(|this, _, _, cx| this.start_todos(cx))).into_any_element(), close_panel(cx)], cx))
+            .on_click(cx.listener(|this, _, _, cx| this.start_todos(cx))).into_any_element()], cx))
         .child(h_flex().px(r(10.)).py(r(6.)).gap(r(4.))
             .child(Button::new("todo-filter").ghost().xsmall().label(this.todo_filter.clone().unwrap_or_else(|| "All tags".into())).dropdown_caret(true)
                 .dropdown_menu(move |menu, _, _| {
@@ -1039,7 +1050,7 @@ fn render_todo_row(
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(r(10.))
+                                .text_size(r(11.5))
                                 .font_medium()
                                 .text_color(theme.primary)
                                 .child(todo.tag),
@@ -1074,16 +1085,6 @@ fn render_todo_row(
 }
 
 /// Return the sidebar to the file tree.
-fn close_panel(cx: &mut Context<Workspace>) -> AnyElement {
-    icon_button("panel-close", IconName::Close, cx)
-        .tooltip(|window, cx| tooltip("Back to files", &ShowFiles, window, cx))
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.panel = Panel::Files;
-            cx.notify();
-        }))
-        .into_any_element()
-}
-
 /// Inset a list row so its hover fill keeps a margin from the sidebar edge.
 trait PipeRow {
     fn pipe_row(self) -> AnyElement;
@@ -1267,7 +1268,7 @@ impl SearchPanel {
                     .h(r(26.))
                     .px(r(6.))
                     .gap(r(6.))
-                    .rounded(r(5.))
+                    .rounded(r(6.))
                     .text_size(r(13.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
@@ -1295,7 +1296,7 @@ impl SearchPanel {
                             .px(r(5.))
                             .rounded(r(4.))
                             .bg(theme.list_hover)
-                            .text_size(r(11.))
+                            .text_size(r(11.5))
                             .text_color(theme.muted_foreground)
                             .child(matches.lines.len().to_string()),
                     )
@@ -1351,8 +1352,8 @@ impl SearchPanel {
                     .pl(r(30.))
                     .pr(r(6.))
                     .gap(r(8.))
-                    .rounded(r(5.))
-                    .text_size(r(12.5))
+                    .rounded(r(6.))
+                    .text_size(r(12.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .child(
@@ -1366,7 +1367,7 @@ impl SearchPanel {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(r(11.))
+                            .text_size(r(11.5))
                             .text_color(theme.muted_foreground)
                             .child(line_number.to_string()),
                     )
@@ -1427,11 +1428,12 @@ impl Render for SearchPanel {
         } else if self.results.total == 0 {
             "No results".into()
         } else {
+            let total = self.results.total;
             format!(
-                "{}{} results in {} files",
-                self.results.total,
+                "{total}{} {} in {}",
                 if self.results.limited { "+" } else { "" },
-                self.results.files.len()
+                if total == 1 { "result" } else { "results" },
+                super::review::plural(self.results.files.len(), "file", "files")
             )
             .into()
         };

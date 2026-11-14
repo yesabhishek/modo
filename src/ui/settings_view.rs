@@ -20,7 +20,7 @@ use gpui_kit::{
 use super::{r, shortcut};
 use crate::{
     brand,
-    settings::{ReviewBase, ReviewLayout, Settings, ThemeChoice},
+    settings::{AutoSaveDelay, ReviewBase, ReviewLayout, Settings, ThemeChoice},
     shells,
     updater::{self, Phase, UpdateState},
 };
@@ -186,9 +186,8 @@ impl SettingsView {
                                 cx,
                             ),
                         ),
-                        row_hint(
-                            "Project gradient",
-                            "A faint tint, different for each project.",
+                        row(
+                            "Tint each project",
                             Switch::new("project-gradients")
                                 .small()
                                 .checked(self.gradient_enabled)
@@ -201,7 +200,6 @@ impl SettingsView {
                                     cx.notify();
                                 }))
                                 .into_any_element(),
-                            cx,
                         ),
                     ],
                     cx,
@@ -215,13 +213,9 @@ impl SettingsView {
                         toggle("Show ignored files", s.show_ignored_files, |s, v| {
                             s.show_ignored_files = v
                         }),
-                        toggle_hint(
-                            "Follow changes on disk",
-                            "Reload files and the review as agents edit.",
-                            s.watch_files,
-                            |s, v| s.watch_files = v,
-                            cx,
-                        ),
+                        toggle("Follow changes on disk", s.watch_files, |s, v| {
+                            s.watch_files = v
+                        }),
                         toggle("Reopen tabs on launch", s.restore_session, |s, v| {
                             s.restore_session = v
                         }),
@@ -301,13 +295,7 @@ impl SettingsView {
                 group(
                     "Saving",
                     vec![
-                        toggle_hint(
-                            "Auto save",
-                            "Saves a moment after you stop typing.",
-                            s.auto_save,
-                            |s, v| s.auto_save = v,
-                            cx,
-                        ),
+                        row("Auto save", auto_save_picker(&s, cx)),
                         toggle("Trim trailing whitespace", s.format_on_save_trim, |s, v| {
                             s.format_on_save_trim = v
                         }),
@@ -319,14 +307,12 @@ impl SettingsView {
                 "Shell",
                 vec![
                     row("Default profile", profile_picker(&s, cx)),
-                    row_hint(
+                    row(
                         "Custom command",
-                        "Quote paths that contain spaces.",
                         div()
                             .w(r(220.))
                             .child(Input::new(&self.shell_input).small())
                             .into_any_element(),
-                        cx,
                     ),
                     row(
                         "Font size",
@@ -355,13 +341,9 @@ impl SettingsView {
                     "Updates",
                     vec![
                         update_row(cx),
-                        toggle_hint(
-                            "Update automatically",
-                            "Checks at launch and installs in the background.",
-                            s.auto_update,
-                            |s, v| s.auto_update = v,
-                            cx,
-                        ),
+                        toggle("Update automatically", s.auto_update, |s, v| {
+                            s.auto_update = v
+                        }),
                     ],
                     cx,
                 ),
@@ -539,7 +521,7 @@ fn row(label: impl Into<SharedString>, control: AnyElement) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(r(13.5))
+                .text_size(r(13.))
                 .child(label.into()),
         )
         .child(div().flex_none().child(control))
@@ -564,7 +546,7 @@ fn row_hint(
                 .flex_1()
                 .min_w_0()
                 .gap(r(1.))
-                .child(div().truncate().text_size(r(13.5)).child(label))
+                .child(div().truncate().text_size(r(13.)).child(label))
                 .child(
                     div()
                         .text_size(r(12.))
@@ -591,14 +573,45 @@ fn toggle(label: &'static str, value: bool, set: fn(&mut Settings, bool)) -> Any
     row(label, switch(label, value, set))
 }
 
-fn toggle_hint(
-    label: &'static str,
-    hint: &'static str,
-    value: bool,
-    set: fn(&mut Settings, bool),
-    cx: &App,
-) -> AnyElement {
-    row_hint(label, hint, switch(label, value, set), cx)
+/// Off, or how soon after typing an edited file is written.
+fn auto_save_picker(settings: &Settings, cx: &App) -> AnyElement {
+    const CHOICES: [(&str, Option<AutoSaveDelay>); 4] = [
+        ("Off", None),
+        ("After 0.25 s", Some(AutoSaveDelay::Quick)),
+        ("After 1 s", Some(AutoSaveDelay::Relaxed)),
+        ("When leaving the file", Some(AutoSaveDelay::OnLeave)),
+    ];
+    let current = settings.auto_save.then_some(settings.auto_save_delay);
+    let label = CHOICES
+        .iter()
+        .find(|(_, choice)| *choice == current)
+        .map_or("Off", |(label, _)| label);
+    Button::new("auto-save")
+        .outline()
+        .small()
+        .min_w(r(180.))
+        .label(label)
+        .dropdown_caret(true)
+        .text_color(cx.theme().foreground)
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+            menu = menu.min_w(px(200.));
+            for (label, choice) in CHOICES {
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(choice == current)
+                        .on_click(move |_, _, cx| {
+                            Settings::update(cx, |s| {
+                                s.auto_save = choice.is_some();
+                                if let Some(delay) = choice {
+                                    s.auto_save_delay = delay;
+                                }
+                            })
+                        }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
 }
 
 fn stepper(
@@ -661,7 +674,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
                 .items_center()
                 .justify_center()
                 .rounded(r(4.))
-                .text_size(r(12.5))
+                .text_size(r(12.))
                 .cursor_pointer()
                 .when(selected, |d| {
                     d.bg(theme.background)
@@ -851,7 +864,7 @@ fn shortcut_row(label: &'static str, keys: &'static str, cx: &App) -> AnyElement
         .child(
             div()
                 .flex_none()
-                .text_size(r(12.5))
+                .text_size(r(12.))
                 .text_color(cx.theme().muted_foreground)
                 .child(keys),
         )
@@ -875,7 +888,7 @@ fn about_header(cx: &App) -> AnyElement {
                         .gap(r(8.))
                         .child(
                             div()
-                                .text_size(r(17.))
+                                .text_size(r(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(brand::NAME),
                         )
@@ -892,7 +905,7 @@ fn about_header(cx: &App) -> AnyElement {
                 )
                 .child(
                     div()
-                        .text_size(r(12.5))
+                        .text_size(r(12.))
                         .text_color(theme.muted_foreground)
                         .child(brand::TAGLINE),
                 ),
@@ -1011,7 +1024,7 @@ impl Render for SettingsView {
                             .h(r(540.))
                             .max_w(gpui_kit::relative(0.94))
                             .max_h(gpui_kit::relative(0.9))
-                            .rounded(r(10.))
+                            .rounded(r(12.))
                             .overflow_hidden()
                             .bg(theme.popover)
                             .border_1()

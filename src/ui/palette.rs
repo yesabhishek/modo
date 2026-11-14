@@ -16,14 +16,11 @@ use gpui_kit::{
     Action, AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement,
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText,
-    Subscription, TextRun, UniformListScrollHandle, WeakEntity, Window, actions, div,
+    Subscription, Task, TextRun, UniformListScrollHandle, Window, actions, div,
     prelude::FluentBuilder, uniform_list,
 };
 
-use super::{
-    r, shortcut,
-    workspace::{self as ws, Workspace},
-};
+use super::{r, shortcut, workspace as ws};
 use crate::{files::FileIndex, search::Fuzzy};
 
 actions!(palette, [SelectPrevious, SelectNext, Close]);
@@ -360,13 +357,16 @@ pub struct Palette {
     root: Option<PathBuf>,
     index: Option<Arc<FileIndex>>,
     recent: Vec<PathBuf>,
+    /// Other open tabs, most recently viewed first.
+    open: Vec<PathBuf>,
     commands: Vec<Command>,
     fuzzy: Fuzzy,
+    /// Ranking a large project runs off the UI thread; typing replaces it.
+    ranking: Option<Task<()>>,
     mode: Mode,
     items: Vec<Item>,
     selected: usize,
     scroll: UniformListScrollHandle,
-    _workspace: WeakEntity<Workspace>,
     _subscription: Subscription,
 }
 
@@ -378,7 +378,7 @@ impl Palette {
         root: Option<PathBuf>,
         index: Option<Arc<FileIndex>>,
         recent: Vec<PathBuf>,
-        workspace: WeakEntity<Workspace>,
+        open: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -414,13 +414,14 @@ impl Palette {
             root,
             index,
             recent,
+            open,
             commands: commands(),
             fuzzy: Fuzzy::default(),
+            ranking: None,
             mode: Mode::Files,
             items: Vec::new(),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
-            _workspace: workspace,
             _subscription: subscription,
         };
         this.update_items(cx);
@@ -441,8 +442,13 @@ impl Palette {
             _ => (Mode::Files, text.trim().to_owned()),
         };
         self.mode = mode;
+        self.ranking = None;
         self.items = match mode {
-            Mode::Files => self.file_items(&query),
+            Mode::Files => match self.file_items(&query, cx) {
+                Some(items) => items,
+                // Still ranking: keep the previous results until it is done.
+                None => return,
+            },
             Mode::Commands => self.command_items(&query),
             Mode::Line => match query.parse::<u32>() {
                 Ok(line) if line > 0 => vec![Item {
@@ -462,47 +468,48 @@ impl Palette {
         cx.notify();
     }
 
-    fn file_items(&mut self, query: &str) -> Vec<Item> {
+    /// Files for `query`, or `None` while a large project is ranked in the
+    /// background (the list updates when it finishes).
+    fn file_items(&mut self, query: &str, cx: &mut Context<Self>) -> Option<Vec<Item>> {
         let (Some(root), Some(index)) = (self.root.clone(), self.index.clone()) else {
-            return Vec::new();
-        };
-        let make = |relative: &Arc<str>, positions: Vec<u32>| {
-            let path = Path::new(relative.as_ref());
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let dir = path
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let name_start = relative.chars().count() - name.chars().count();
-            Item {
-                icon: AnyIcon::Path(path.to_path_buf()),
-                title: name.into(),
-                detail: (!dir.is_empty()).then(|| dir.into()),
-                keys: "",
-                positions: positions
-                    .into_iter()
-                    .filter(|p| *p as usize >= name_start)
-                    .map(|p| p - name_start as u32)
-                    .collect(),
-                target: Target::File(root.join(relative.as_ref())),
-            }
+            return Some(Vec::new());
         };
         if query.is_empty() {
-            return index
+            // Open tabs first, then the project in order.
+            let open: Vec<Item> = self
+                .open
+                .iter()
+                .filter_map(|path| path.strip_prefix(&root).ok())
+                .map(|relative| file_item(&root, &crate::files::relative_str(relative), Vec::new()))
+                .collect();
+            let rest = index
                 .files
                 .iter()
+                .filter(|file| !self.open.iter().any(|path| path.ends_with(file.as_ref())))
                 .take(60)
-                .map(|f| make(f, Vec::new()))
-                .collect();
+                .map(|file| file_item(&root, file, Vec::new()));
+            return Some(open.into_iter().chain(rest).collect());
         }
-        self.fuzzy
-            .rank(query, &index.files, 80)
-            .into_iter()
-            .map(|m| make(&index.files[m.index], m.positions))
-            .collect()
+        // Ranking is linear in the project size: small projects stay on
+        // this thread so results appear in the same frame.
+        if index.files.len() < 5_000 {
+            return Some(rank_files(&mut self.fuzzy, &root, &index, query));
+        }
+        let query = query.to_owned();
+        self.ranking = Some(cx.spawn(async move |this, cx| {
+            let items = cx
+                .background_executor()
+                .spawn(async move { rank_files(&mut Fuzzy::default(), &root, &index, &query) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.items = items;
+                this.selected = 0;
+                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                this.ranking = None;
+                cx.notify();
+            });
+        }));
+        None
     }
 
     fn command_items(&mut self, query: &str) -> Vec<Item> {
@@ -659,7 +666,7 @@ impl Palette {
                         row.child(
                             div()
                                 .truncate()
-                                .text_size(r(12.5))
+                                .text_size(r(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(detail),
                         )
@@ -681,6 +688,40 @@ impl Palette {
                 )
             });
         div().w_full().px(r(6.)).child(row).into_any_element()
+    }
+}
+
+fn rank_files(fuzzy: &mut Fuzzy, root: &Path, index: &FileIndex, query: &str) -> Vec<Item> {
+    fuzzy
+        .rank(query, &index.files, 80)
+        .into_iter()
+        .map(|m| file_item(root, &index.files[m.index], m.positions))
+        .collect()
+}
+
+/// A file row: the name (with matched characters), then its folder.
+fn file_item(root: &Path, relative: &Arc<str>, positions: Vec<u32>) -> Item {
+    let path = Path::new(relative.as_ref());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name_start = (relative.chars().count() - name.chars().count()) as u32;
+    Item {
+        icon: AnyIcon::Path(path.to_path_buf()),
+        title: name.into(),
+        detail: (!dir.is_empty()).then(|| dir.into()),
+        keys: "",
+        positions: positions
+            .into_iter()
+            .filter(|p| *p >= name_start)
+            .map(|p| p - name_start)
+            .collect(),
+        target: Target::File(root.join(relative.as_ref())),
     }
 }
 
@@ -824,7 +865,7 @@ impl Render for Palette {
                                     div()
                                         .px(r(18.))
                                         .py(r(14.))
-                                        .text_size(r(13.5))
+                                        .text_size(r(13.))
                                         .text_color(theme.muted_foreground)
                                         .child(message),
                                 ),

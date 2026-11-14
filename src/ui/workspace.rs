@@ -90,8 +90,6 @@ actions!(
 );
 
 const CONTEXT: &str = "Workspace";
-/// The pause in typing that triggers an automatic save.
-const AUTO_SAVE_DELAY: Duration = Duration::from_millis(250);
 /// Editors kept mounted. Each holds its text, undo history, and syntax tree;
 /// past this many, the tabs unused longest go back to being a path and are
 /// read again when next shown.
@@ -185,6 +183,8 @@ pub fn init(cx: &mut App) {
                 }
             });
         }
+        // Settings and session are written in the background; finish now.
+        crate::settings::flush();
         async {}
     })
     .detach();
@@ -341,7 +341,15 @@ pub struct GitState {
     pub repo: Option<git::Repository>,
     /// Folders (relative) that contain at least one change.
     pub dirty_dirs: HashSet<PathBuf>,
+    /// Bumped when the project changes, so a late answer for the previous
+    /// project is dropped.
     pub generation: u64,
+    /// At most one `git status` runs; requests that arrive meanwhile are
+    /// folded into a single follow-up run.
+    running: bool,
+    queued: bool,
+    /// A refresh waiting for typing (and auto save) to settle.
+    debounce: Option<Task<()>>,
 }
 
 pub struct Workspace {
@@ -366,8 +374,9 @@ pub struct Workspace {
     pub settings: Option<Entity<SettingsView>>,
     pub status: Option<SharedString>,
     pub new_file: Option<NewFile>,
-    /// Files the watcher saw change; reloaded on the next frame with a window.
-    pending_reload: Option<HashSet<PathBuf>>,
+    /// Files the watcher saw change (`None` inside: all of them); reloaded on
+    /// the next frame with a window.
+    pending_reload: Option<Option<HashSet<PathBuf>>>,
     /// Files Modo just wrote, so the watcher can tell its own saves from an
     /// agent's edits and skip the reload, re-index, and tree refresh.
     recent_saves: HashMap<PathBuf, Instant>,
@@ -392,6 +401,7 @@ pub struct Workspace {
     restoring_active: Option<PathBuf>,
     watcher_start: Option<Task<()>>,
     watcher: Option<Watcher>,
+    palette_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     weak: WeakEntity<Self>,
 }
@@ -428,6 +438,13 @@ impl Workspace {
             }),
             cx.observe_global::<crate::updater::UpdateState>(|_, cx| cx.notify()),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.subscribe(
+                &terminal,
+                |this, _, _: &super::terminal::ClipboardWritten, cx| {
+                    this.status = Some("Copied by a program in the terminal".into());
+                    cx.notify();
+                },
+            ),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_git(cx);
@@ -516,6 +533,7 @@ impl Workspace {
             restoring_active: None,
             watcher_start: None,
             watcher: None,
+            palette_subscription: None,
             _subscriptions: subscriptions,
             weak,
         };
@@ -868,26 +886,40 @@ impl Workspace {
         let Some(root) = self.root().map(Path::to_path_buf) else {
             return;
         };
-        self.git.generation += 1;
+        self.git.debounce = None;
+        if self.git.running {
+            self.git.queued = true;
+            return;
+        }
+        self.git.running = true;
+        self.git.queued = false;
         let generation = self.git.generation;
         cx.spawn(async move |this, cx| {
-            let repo = cx
+            let (repo, dirty_dirs) = cx
                 .background_executor()
-                .spawn(async move { git::inspect(&root).ok().flatten() })
+                .spawn(async move {
+                    let repo = git::inspect(&root).ok().flatten();
+                    let mut dirty_dirs = HashSet::new();
+                    if let Some(repo) = &repo {
+                        for change in &repo.changes {
+                            for ancestor in change.path.ancestors().skip(1) {
+                                if !dirty_dirs.insert(repo.root.join(ancestor)) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    (repo, dirty_dirs)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.git.generation != generation {
                     return;
                 }
-                let mut dirty_dirs = HashSet::new();
-                if let Some(repo) = &repo {
-                    for change in &repo.changes {
-                        for ancestor in change.path.ancestors().skip(1) {
-                            if !dirty_dirs.insert(repo.root.join(ancestor)) {
-                                break;
-                            }
-                        }
-                    }
+                this.git.running = false;
+                if this.git.queued {
+                    // Something changed while Git was reading; read again.
+                    this.refresh_git(cx);
                 }
                 let changed = this
                     .git
@@ -908,6 +940,17 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Refresh once things have been quiet for a moment. Auto save writes a
+    /// file after every pause in typing; Git need not run after each one.
+    fn refresh_git_soon(&mut self, cx: &mut Context<Self>) {
+        self.git.debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let _ = this.update(cx, |this, cx| this.refresh_git(cx));
+        }));
     }
 
     pub fn change_for(&self, path: &Path) -> Option<&git::Change> {
@@ -963,17 +1006,27 @@ impl Workspace {
             return;
         }
         let generation = self.project_generation;
-        let (tx, rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<FileEvent>();
         self.watcher_start = Some(cx.spawn(async move |this, cx| {
             let watcher = cx
                 .background_executor()
                 .spawn(async move {
                     use notify::Watcher as _;
+                    let watched = root.clone();
+                    // Runs on the watcher's own thread: build output and Git's
+                    // object store are dropped, and each path is checked on
+                    // disk, before anything reaches the UI thread.
                     let mut watcher = notify::recommended_watcher(
                         move |event: notify::Result<notify::Event>| {
-                            if let Ok(event) = event {
-                                for path in event.paths {
-                                    let _ = tx.unbounded_send(path);
+                            let Ok(event) = event else { return };
+                            if event.need_rescan() {
+                                let _ = tx.unbounded_send(FileEvent::Rescan);
+                                return;
+                            }
+                            for path in event.paths {
+                                if worth_watching(&watched, &path) {
+                                    let exists = path.exists();
+                                    let _ = tx.unbounded_send(FileEvent::Changed { path, exists });
                                 }
                             }
                         },
@@ -997,7 +1050,7 @@ impl Workspace {
     fn watch_events(
         &mut self,
         watcher: notify::RecommendedWatcher,
-        mut rx: futures::channel::mpsc::UnboundedReceiver<PathBuf>,
+        mut rx: futures::channel::mpsc::UnboundedReceiver<FileEvent>,
         cx: &mut Context<Self>,
     ) {
         let task = cx.spawn(async move |this, cx| {
@@ -1007,14 +1060,28 @@ impl Workspace {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
-                let mut paths = vec![first];
-                while let Ok(path) = rx.try_recv() {
-                    paths.push(path);
-                }
-                if this
-                    .update(cx, |this, cx| this.files_changed(paths, cx))
-                    .is_err()
+                let mut changed: HashMap<PathBuf, bool> = HashMap::new();
+                let mut rescan = false;
+                for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()))
                 {
+                    match event {
+                        FileEvent::Changed { path, exists } => {
+                            changed.insert(path, exists);
+                        }
+                        FileEvent::Rescan => rescan = true,
+                    }
+                }
+                // A checkout or an install touches thousands of files: read
+                // everything again once instead of following each one.
+                let rescan = rescan || changed.len() > MAX_TRACKED_CHANGES;
+                let result = this.update(cx, |this, cx| {
+                    if rescan {
+                        this.everything_changed(cx)
+                    } else {
+                        this.files_changed(changed.into_iter().collect(), cx)
+                    }
+                });
+                if result.is_err() {
                     return;
                 }
             }
@@ -1025,7 +1092,24 @@ impl Workspace {
         });
     }
 
-    fn files_changed(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// Too much changed to follow path by path.
+    fn everything_changed(&mut self, cx: &mut Context<Self>) {
+        let dirs: Vec<PathBuf> = self.tree.children.keys().cloned().collect();
+        for dir in dirs {
+            self.load_dir(dir, cx);
+        }
+        self.refresh_git(cx);
+        self.start_index(cx);
+        if self.todo_loaded || self.panel == Panel::Todos {
+            self.start_todos(cx);
+        }
+        self.review_changed(cx);
+        self.pending_reload = Some(None);
+        cx.notify();
+    }
+
+    /// `paths` pairs each changed path with whether it still exists.
+    fn files_changed(&mut self, mut paths: Vec<(PathBuf, bool)>, cx: &mut Context<Self>) {
         let Some(root) = self.root().map(Path::to_path_buf) else {
             return;
         };
@@ -1037,14 +1121,14 @@ impl Workspace {
         if !self.recent_saves.is_empty() {
             let saves = &self.recent_saves;
             let tabs = &self.tabs;
-            paths.retain(|path| {
+            paths.retain(|(path, exists)| {
                 // Exact for the saved file: still what the tab wrote. An agent
                 // editing it a second later changes the stamp and is followed.
                 let unchanged = saves.contains_key(path)
                     && tabs.iter().any(
                         |tab| matches!(tab, Tab::File(file) if &file.path == path && file.matches_disk()),
                     );
-                !unchanged && !is_save_temporary(path, saves)
+                !unchanged && !is_save_temporary(path, *exists, saves)
             });
             if paths.is_empty() {
                 if self.todo_loaded || self.panel == Panel::Todos {
@@ -1057,25 +1141,13 @@ impl Workspace {
         let mut git_changed = false;
         let mut worktree_changed = false;
         let mut created_or_removed = false;
-        for path in &paths {
+        // The watcher thread already dropped build output and Git's object store.
+        for (path, exists) in &paths {
             let Ok(relative) = path.strip_prefix(&root) else {
                 continue;
             };
-            let mut parts = relative
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy());
-            let first = parts.next().unwrap_or_default();
-            if first == ".git" {
-                let second = parts.next().unwrap_or_default();
-                if second != "objects" && second != "logs" {
-                    git_changed = true;
-                }
-                continue;
-            }
-            if files::HEAVY_DIRS
-                .iter()
-                .any(|heavy| relative.components().any(|c| c.as_os_str() == *heavy))
-            {
+            if relative.starts_with(".git") {
+                git_changed = true;
                 continue;
             }
             worktree_changed = true;
@@ -1084,16 +1156,18 @@ impl Workspace {
             {
                 dirs.insert(parent.to_path_buf());
             }
-            if !path.exists()
-                || !self.index.as_ref().is_some_and(|i| {
-                    i.files
-                        .binary_search_by(|p| (**p).cmp(&*files::relative_str(relative)))
-                        .is_ok()
-                })
-            {
-                created_or_removed = true;
+            if !created_or_removed {
+                let relative = files::relative_str(relative);
+                created_or_removed = !exists
+                    || !self.index.as_ref().is_some_and(|index| {
+                        index
+                            .files
+                            .binary_search_by(|p| (**p).cmp(&*relative))
+                            .is_ok()
+                    });
             }
         }
+        let paths: Vec<PathBuf> = paths.into_iter().map(|(path, _)| path).collect();
         if paths.iter().any(|path| {
             path.file_name()
                 .is_some_and(|name| name == ".ignore" || name == ".gitignore")
@@ -1113,7 +1187,7 @@ impl Workspace {
             }
             self.review_changed(cx);
             let changed: HashSet<PathBuf> = paths.into_iter().collect();
-            self.pending_reload = Some(changed);
+            self.pending_reload = Some(Some(changed));
             cx.notify();
         }
         if created_or_removed {
@@ -1325,7 +1399,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let path = dunce::canonicalize(&path).unwrap_or(path);
-        if path.is_file() {
+        // The link was checked against the project before; a symlink inside
+        // the project could still point elsewhere.
+        if self.root().is_some_and(|root| !path.starts_with(root)) {
+            self.notify_error("This link leads outside the project.", window, cx);
+        } else if path.is_file() {
             self.open_file(path, line, window, cx);
         } else if path.is_dir() {
             self.sidebar_open = true;
@@ -1765,9 +1843,13 @@ impl Workspace {
         if !Settings::get(cx).auto_save || !file.auto_save_ready() {
             return;
         }
+        // "When leaving the file" waits for a tab switch or focus change.
+        let Some(delay) = Settings::get(cx).auto_save_delay.delay() else {
+            return;
+        };
         let editor = file.editor.clone();
         file.auto_save_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(AUTO_SAVE_DELAY).await;
+            cx.background_executor().timer(delay).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if !Settings::get(cx).auto_save { return; }
                 if let Some(ix) = this.tabs.iter().position(|tab| matches!(tab, Tab::File(file) if file.editor == editor && file.auto_save_ready())) {
@@ -1892,7 +1974,11 @@ impl Workspace {
                         } else {
                             this.schedule_auto_save(ix, window, cx);
                         }
-                        this.refresh_git(cx);
+                        if automatic {
+                            this.refresh_git_soon(cx);
+                        } else {
+                            this.refresh_git(cx);
+                        }
                     }
                     Err(error) => {
                         this.notify_error(error, window, cx);
@@ -2096,10 +2182,23 @@ impl Workspace {
         let index = self.index.clone();
         let root = self.root().map(Path::to_path_buf);
         let recent = Session::get(cx).recent.clone();
-        let workspace = self.weak.clone();
-        let palette =
-            cx.new(|cx| Palette::new(initial, root, index, recent, workspace, window, cx));
-        self._subscriptions.push(cx.subscribe_in(
+        // Other open tabs, most recently viewed first: an empty query lists
+        // these before the rest of the project.
+        let mut open: Vec<(u64, PathBuf)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| Some(*ix) != self.active)
+            .filter_map(|(_, tab)| match tab {
+                Tab::File(file) => Some((file.last_shown, file.path.clone())),
+                Tab::Pending(pending) => Some((0, pending.path.clone())),
+                Tab::Review => None,
+            })
+            .collect();
+        open.sort_by_key(|(shown, _)| std::cmp::Reverse(*shown));
+        let open = open.into_iter().map(|(_, path)| path).collect();
+        let palette = cx.new(|cx| Palette::new(initial, root, index, recent, open, window, cx));
+        self.palette_subscription = Some(cx.subscribe_in(
             &palette,
             window,
             |this, _, event, window, cx| this.on_palette_event(event, window, cx),
@@ -2304,7 +2403,7 @@ impl Workspace {
                 .pr(r(4.))
                 .gap(r(6.))
                 .rounded(r(6.))
-                .text_size(r(12.5))
+                .text_size(r(12.))
                 .cursor_pointer()
                 .when(active, |t| {
                     t.bg(theme.list_active).text_color(theme.foreground)
@@ -2563,12 +2662,14 @@ impl Workspace {
                                 .size(r(13.)),
                         )
                         .child(branch)
+                        // Git status counts what is not committed, which is
+                        // not what the branch review counts; say so.
                         .when(changes > 0, |row| {
                             let plus = if limited { "+" } else { "" };
                             row.child(
                                 div()
                                     .text_color(theme.yellow)
-                                    .child(format!("{changes}{plus} changed")),
+                                    .child(format!("{changes}{plus} uncommitted")),
                             )
                         }),
                 )
@@ -2612,11 +2713,43 @@ impl Workspace {
 
 /// The temporary file a recent save wrote beside its target and has since
 /// renamed into place.
-fn is_save_temporary(path: &Path, saves: &HashMap<PathBuf, Instant>) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+fn is_save_temporary(path: &Path, exists: bool, saves: &HashMap<PathBuf, Instant>) -> bool {
+    !exists
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
         && saves.keys().any(|saved| saved.parent() == path.parent())
-        && !path.exists()
+}
+
+/// What the file watcher reports to the window.
+enum FileEvent {
+    /// A path changed; whether it still exists was checked off the UI thread.
+    Changed { path: PathBuf, exists: bool },
+    /// The operating system dropped events; everything may have changed.
+    Rescan,
+}
+
+/// More changed paths than this in one burst are handled as a rescan.
+const MAX_TRACKED_CHANGES: usize = 2_000;
+
+/// Whether a changed path matters to the window: anything in the project
+/// except build output, dependencies, and Git's object store and logs.
+fn worth_watching(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = relative.components().map(|c| c.as_os_str());
+    match parts.next() {
+        Some(first) if first == ".git" => {
+            !matches!(parts.next(), Some(second) if second == "objects" || second == "logs")
+        }
+        Some(_) => !relative.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| files::HEAVY_DIRS.contains(&name))
+        }),
+        None => true,
+    }
 }
 
 /// Cancels a background walk when its owning task is dropped.
@@ -2669,7 +2802,7 @@ impl Render for Workspace {
                 .detach();
         });
         if let Some(paths) = self.pending_reload.take() {
-            self.reload_clean_files(Some(&paths), window, cx);
+            self.reload_clean_files(paths.as_ref(), window, cx);
         }
         let theme = cx.theme().clone();
 

@@ -43,4 +43,12 @@ src/
 - **Tabs are cheap until shown.** A tab restored from the session is only a path; its file is read and its editor mounted when the tab is first selected. At most twelve editors stay mounted: beyond that, the clean tabs unused longest go back to being a path, keeping their place, cursor, and preview state. A tab with unsaved edits is never unloaded.
 - **The diff is read when it is looked at.** Changes mark the review stale; it is re-read at once if the Review tab, the overview, or the change list is on screen, and otherwise when one of them next is.
 - **No font listing at launch.** Listing every installed family costs about a tenth of a second on macOS. The editor font is resolved by asking the text system for one name at a time; the full list is read on a background thread only when Settings is opened.
-- **Terminal.** alacritty_terminal runs the PTY and parses output; Modo paints the grid itself, one styled run per span. The shell starts at the panel's real size, as a direct login shell.
+- **Terminal.** alacritty_terminal runs the PTY and parses output; Modo paints the grid itself, one styled run per span. The shell starts at the panel's real size, as a direct login shell. Programs may copy to the clipboard (OSC 52) but never read it.
+
+## Trust boundaries
+
+A folder Modo opens is untrusted input: an agent wrote it, or it came from an archive or a shared drive.
+
+- **Git** runs with the repository's own filters, file system monitor, signature checks, and lazy fetches switched off (`git.rs`, `SAFE_CONFIG` and `repository_filters`). Submodule contents are never examined.
+- **Markdown** links open only `http`, `https`, and `mailto`; files and images resolve only inside the project, checked lexically and again after symlinks are resolved. Modo has no HTTP client, so remote images never load.
+- **Updates** install only when the release's SHA256SUMS file carries a valid Ed25519 signature from `RELEASE_KEY` (`brand.rs`). System tools run by full path.

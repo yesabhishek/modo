@@ -34,14 +34,6 @@ pub fn shortcut(mac: &'static str, other: &'static str) -> &'static str {
     if is_mac() { mac } else { other }
 }
 
-/// Muted keyboard hint, Notion style (no boxes, just quiet glyphs).
-pub fn kbd(keys: &'static str, cx: &App) -> Div {
-    div()
-        .text_size(r(11.5))
-        .text_color(cx.theme().muted_foreground.opacity(0.8))
-        .child(keys)
-}
-
 /// The small uppercase-free label above a sidebar or settings section.
 pub fn section_label(text: impl Into<SharedString>, cx: &App) -> Div {
     div()
@@ -97,10 +89,6 @@ impl NavRow {
     }
     pub fn icon(mut self, icon: impl IconNamed) -> Self {
         self.icon = Some(Icon::new(icon));
-        self
-    }
-    pub fn trailing(mut self, element: impl IntoElement) -> Self {
-        self.trailing = Some(element.into_any_element());
         self
     }
     pub fn selected(mut self, selected: bool) -> Self {

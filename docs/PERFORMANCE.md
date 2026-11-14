@@ -25,7 +25,11 @@ Most of the binary is Tree-sitter grammar tables. They are memory-mapped and onl
 - A save does not re-index the project, refresh the file tree, or reload the tab that was saved.
 - The review diff is re-read when it is on screen, not after every change.
 - Checks for files changed on disk run off the UI thread, and a file whose size and time are unchanged is not read.
-- Mermaid diagrams are laid out and rasterised on a background thread.
+- The file watcher drops build output, dependencies, and Git's object store on its own thread and checks each path there; more than 2,000 changes in one burst are handled as a single rescan.
+- At most one `git status` runs at a time; changes that arrive meanwhile fold into one follow-up. Auto save waits for typing to settle before asking Git.
+- Settings and the session are written on a background thread and flushed on quit.
+- Go to file ranks projects of 5,000 files or more off the UI thread.
+- Mermaid diagrams are laid out and rasterised on a background thread, capped at 8 megapixels each and 96 MB in all, and uploaded as raw pixels.
 
 ## How to measure
 

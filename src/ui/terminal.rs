@@ -9,7 +9,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point as GridPoint, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, Term, TermMode, cell::Flags, point_to_viewport, viewport_to_point},
+    term::{Config, Osc52, Term, TermMode, cell::Flags, point_to_viewport, viewport_to_point},
     tty,
     vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb},
 };
@@ -23,12 +23,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Element,
-    ElementId, Empty, Entity, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Style,
-    Styled, Task, TextAlign, TextRun, WeakEntity, Window, actions, div, fill, outline, point,
-    prelude::FluentBuilder, px, relative, size,
+    ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
+    GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, SharedString,
+    StatefulInteractiveElement, Style, Styled, Task, TextAlign, TextRun, WeakEntity, Window,
+    actions, div, fill, outline, point, prelude::FluentBuilder, px, relative, size,
 };
 
 use super::{icon_button, is_mac, r};
@@ -41,6 +41,12 @@ actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 
 const CONTEXT: &str = "Terminal";
 const SCROLLBACK: usize = 10_000;
+/// The most a program may put on the clipboard with an OSC 52 escape.
+const MAX_CLIPBOARD_WRITE: usize = 1024 * 1024;
+
+/// A program running in a terminal replaced the clipboard (OSC 52). The
+/// workspace says so, because the user did not copy anything themselves.
+pub struct ClipboardWritten;
 
 pub fn init(cx: &mut App) {
     let mut bindings = vec![
@@ -277,6 +283,10 @@ impl TerminalPanel {
         self.next_id += 1;
         let cwd = self.cwd.clone();
         let view = cx.new(|cx| TerminalView::new(id, cwd, profile, window, cx));
+        cx.subscribe(&view, |_, _, _: &ClipboardWritten, cx| {
+            cx.emit(ClipboardWritten)
+        })
+        .detach();
         cx.observe(&view, |this, view, cx| {
             if view.read(cx).exited {
                 this.remove(&view, cx);
@@ -349,6 +359,9 @@ impl TerminalPanel {
     }
 }
 
+impl EventEmitter<ClipboardWritten> for TerminalPanel {}
+impl EventEmitter<ClipboardWritten> for TerminalView {}
+
 impl Render for TerminalPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -363,8 +376,8 @@ impl Render for TerminalPanel {
                 .pl(r(8.))
                 .pr(r(2.))
                 .gap(r(4.))
-                .rounded(r(5.))
-                .text_size(r(12.5))
+                .rounded(r(6.))
+                .text_size(r(12.))
                 .cursor_pointer()
                 .when(active, |t| {
                     t.bg(theme.list_active).text_color(theme.foreground)
@@ -765,6 +778,9 @@ impl TerminalView {
         self.size = size;
         let config = Config {
             scrolling_history: SCROLLBACK,
+            // Programs may copy (tmux, Neovim over SSH) but never read the
+            // clipboard: output must not be able to read a pasted password.
+            osc52: Osc52::OnlyCopy,
             ..Config::default()
         };
         match tty::new(&spawn.options, size.window_size(), spawn.id) {
@@ -792,15 +808,9 @@ impl TerminalView {
             TermEvent::Title(title) => self.title = clean_title(&title, &self.program),
             TermEvent::ResetTitle => self.title = self.program.clone(),
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
-            TermEvent::ClipboardStore(_, text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text))
-            }
-            TermEvent::ClipboardLoad(_, format) => {
-                let text = cx
-                    .read_from_clipboard()
-                    .and_then(|c| c.text())
-                    .unwrap_or_default();
-                self.write(format(&text).into_bytes());
+            TermEvent::ClipboardStore(_, text) if text.len() <= MAX_CLIPBOARD_WRITE => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                cx.emit(ClipboardWritten);
             }
             TermEvent::TextAreaSizeRequest(format) => {
                 self.write(format(self.size.window_size()).into_bytes())

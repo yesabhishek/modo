@@ -159,6 +159,18 @@ fn display_line(matcher: &RegexMatcher, line: u32, raw: &str) -> LineMatch {
     LineMatch { line, text, ranges }
 }
 
+/// `needle` is already lowercase. ASCII names, nearly all of them, are
+/// compared without allocating.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if haystack.is_ascii() && needle.is_ascii() {
+        let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+        return n.is_empty()
+            || h.windows(n.len())
+                .any(|window| window.eq_ignore_ascii_case(n));
+    }
+    haystack.to_lowercase().contains(needle)
+}
+
 /// Fuzzy path matching for quick open, scored like a good file picker:
 /// file-name hits beat directory hits, shorter paths win ties.
 pub struct Fuzzy {
@@ -189,15 +201,15 @@ impl Fuzzy {
             pattern::{CaseMatching, Normalization, Pattern},
         };
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        // Computed once, not once per matching file.
+        let needle = query.to_lowercase().replace(' ', "");
         let mut found = Vec::new();
         for (index, candidate) in candidates.iter().enumerate() {
             let haystack = Utf32Str::new(candidate, &mut self.buffer);
             if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                 let name_start = candidate.rfind('/').map_or(0, |i| i + 1);
-                let bonus = if candidate[name_start..]
-                    .to_lowercase()
-                    .contains(&query.to_lowercase().replace(' ', ""))
-                {
+                let name = &candidate[name_start..];
+                let bonus = if contains_ignore_case(name, &needle) {
                     40
                 } else {
                     0

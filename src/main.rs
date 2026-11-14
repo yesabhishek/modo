@@ -318,13 +318,13 @@ fn main() {
             }
         })
         .detach();
-        let path = args.path.clone().or_else(|| {
-            // Reopen the last project when launched without a path.
-            Settings::get(cx)
-                .restore_session
-                .then(|| Session::get(cx).recent.first().cloned())
-                .flatten()
-        });
+        // Reopen the last project that still exists when launched without a path.
+        let recent = if args.path.is_none() && Settings::get(cx).restore_session {
+            Session::get(cx).recent.clone()
+        } else {
+            Vec::new()
+        };
+        Session::prune_missing(cx);
         #[cfg(feature = "capture")]
         if let Some((output, scene)) = args.capture.clone() {
             capture::run(args.path.clone(), output, scene, cx);
@@ -333,20 +333,23 @@ fn main() {
         // Finder may launch us to open a folder; give that request a moment to
         // arrive so we do not also restore the previous project. The window
         // is created meanwhile and filled in once the choice is made.
-        let explicit = args.path.is_some();
+        let explicit = args.path.clone();
         let launch = open_launch_window(cx);
         cx.spawn(async move |cx| {
             use futures::StreamExt as _;
-            let first = if explicit {
-                None
+            let (first, previous) = if explicit.is_some() {
+                (None, None)
             } else {
+                let previous = cx
+                    .background_executor()
+                    .spawn(async move { recent.into_iter().find(|path| path.is_dir()) });
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(60))
                     .await;
-                open_rx.try_recv().ok()
+                (open_rx.try_recv().ok(), previous.await)
             };
             cx.update(|cx| {
-                let target = first.or(path);
+                let target = first.or(explicit).or(previous);
                 let filled = launch.is_some_and(|(window, workspace)| {
                     window
                         .update(cx, |_, window, cx| {

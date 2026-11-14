@@ -18,7 +18,6 @@ use futures::{StreamExt, channel::mpsc};
 use gpui_kit::{App, Global, SharedString};
 use semver::Version;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::{
     brand,
@@ -126,8 +125,6 @@ struct Asset {
     browser_download_url: String,
     #[serde(default)]
     size: u64,
-    #[serde(default)]
-    digest: Option<String>,
 }
 
 /// The executable as it was at launch, to notice when it is replaced under us.
@@ -169,9 +166,46 @@ fn dormant() -> bool {
         || std::env::args_os().any(|arg| arg == "--capture")
 }
 
-/// Only packaged release builds replace themselves.
+/// Only packaged release builds that can check the publisher's signature
+/// replace themselves.
 fn self_updating(exe: &Path) -> bool {
-    !cfg!(debug_assertions) && is_installed(exe, std::env::consts::OS)
+    !cfg!(debug_assertions) && release_key().is_some() && is_installed(exe, std::env::consts::OS)
+}
+
+fn release_key() -> Option<[u8; 32]> {
+    decode_hex(brand::RELEASE_KEY)?.try_into().ok()
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// The automatic check runs at most once a day; the button always checks.
+const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn last_check_marker() -> Option<PathBuf> {
+    Some(settings::config_dir()?.join("updates").join("last-check"))
+}
+
+fn checked_recently() -> bool {
+    last_check_marker()
+        .and_then(|marker| fs::metadata(marker).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < CHECK_INTERVAL)
+}
+
+fn mark_checked() {
+    if let Some(marker) = last_check_marker() {
+        let _ = fs::write(marker, b"");
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -179,8 +213,11 @@ pub fn init(cx: &mut App) {
     if dormant() {
         return;
     }
-    let installed = launched().is_some_and(|(exe, _)| self_updating(exe));
-    if !installed || !Settings::get(cx).auto_update {
+    // Packaged builds check by themselves; whether they may also install is
+    // decided by `self_updating`.
+    let packaged = launched()
+        .is_some_and(|(exe, _)| !cfg!(debug_assertions) && is_installed(exe, std::env::consts::OS));
+    if !packaged || !Settings::get(cx).auto_update {
         return;
     }
     cx.spawn(async move |cx| {
@@ -238,13 +275,20 @@ fn start(mode: Mode, cx: &mut App) {
     let (tx, mut rx) = mpsc::unbounded::<Phase>();
     cx.spawn(async move |cx| {
         let worker = cx.background_executor().spawn(async move {
+            if mode == Mode::Automatic && checked_recently() {
+                let _ = tx.unbounded_send(previous);
+                return;
+            }
             let install = installable && mode != Mode::Check;
             let result = match &exe {
                 Some(exe) => check_and_install(exe, install, installable, &tx),
                 None => Err("Modo cannot find its own executable".into()),
             };
             let last = match result {
-                Ok(phase) => phase,
+                Ok(phase) => {
+                    mark_checked();
+                    phase
+                }
                 Err(error) => {
                     crate::startup::log(format!("update: {error}"));
                     if mode == Mode::Automatic {
@@ -314,6 +358,7 @@ pub fn cancel_restart() {
 
 /// Called once every window agreed to close.
 pub fn finish_quit(cx: &mut App) {
+    settings::flush();
     if !RESTART.swap(false, Ordering::Relaxed) {
         cx.quit();
         return;
@@ -460,49 +505,31 @@ fn check_and_install(
         &release.tag_name,
         &asset.name,
     )?;
-    let expected = match asset
-        .digest
-        .as_deref()
-        .and_then(|digest| digest.strip_prefix("sha256:"))
-    {
-        Some(digest) => digest.to_owned(),
-        None => {
-            let stem = asset
-                .name
-                .trim_end_matches("-setup.exe")
-                .trim_end_matches(".tar.gz")
-                .trim_end_matches(".zip");
-            let checksum = release
-                .assets
-                .iter()
-                .find(|candidate| candidate.name == format!("{stem}-SHA256SUMS.txt"))
-                .or_else(|| {
-                    release.assets.iter().find(|candidate| {
-                        candidate.name == format!("modo-{version}-linux-SHA256SUMS.txt")
-                    })
-                })
-                .ok_or("This release has no SHA-256 checksum")?;
-            validate_asset_url(
-                &checksum.browser_download_url,
-                repo,
-                &release.tag_name,
-                &checksum.name,
-            )?;
-            let checksum_path = stage.path().join("SHA256SUMS.txt");
-            download(
-                &checksum.browser_download_url,
-                &checksum_path,
-                64 * 1024,
-                15,
-                None,
-            )?;
-            checksum_for(
-                &fs::read_to_string(checksum_path).map_err(|e| e.to_string())?,
-                &asset.name,
-            )
-            .ok_or("The package is missing from SHA256SUMS")?
-        }
+    // The checksum list is signed by the publisher's key, which GitHub never
+    // holds: a release published by anyone else does not install.
+    let key = release_key().ok_or("This build cannot verify releases")?;
+    let fetch_small = |name: &str| -> Result<Vec<u8>, String> {
+        let found = release
+            .assets
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .ok_or("This release is not signed")?;
+        validate_asset_url(
+            &found.browser_download_url,
+            repo,
+            &release.tag_name,
+            &found.name,
+        )?;
+        let path = stage.path().join(name);
+        download(&found.browser_download_url, &path, 256 * 1024, 15, None)?;
+        fs::read(path).map_err(|e| e.to_string())
     };
+    let sums_name = format!("modo-{version}-SHA256SUMS.txt");
+    let sums = fetch_small(&sums_name)?;
+    let signature = fetch_small(&format!("{sums_name}.sig"))?;
+    verify_signature(&key, &sums, &signature)?;
+    let expected = checksum_for(&String::from_utf8_lossy(&sums), &asset.name)
+        .ok_or("The package is missing from SHA256SUMS")?;
     let _ = tx.unbounded_send(Phase::Downloading {
         version: version.clone(),
         percent: None,
@@ -522,7 +549,7 @@ fn check_and_install(
         Some((asset.size, &progress)),
     )?;
     verify_checksum(&package, &expected)?;
-    if let Err(error) = install(exe, &package, &version, &dir) {
+    if let Err(error) = install(exe, &package, &version, &dir, &expected) {
         crate::startup::log(format!("update installation: {error}"));
         if package.extension().is_some_and(|ext| ext == "deb") {
             // A system package: hand it to the package installer.
@@ -555,6 +582,35 @@ fn validate_asset_url(url: &str, repo: &str, tag: &str, name: &str) -> Result<()
 
 type Progress<'a> = (u64, &'a dyn Fn(u8));
 
+/// A system program by its full path, never a same-named file earlier on PATH.
+#[cfg(not(windows))]
+fn system_tool(candidates: &[&str]) -> Result<PathBuf, String> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{} is not installed", candidates[0]))
+}
+
+#[cfg(windows)]
+fn system32(name: &str) -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join(name)
+}
+
+#[cfg(windows)]
+fn curl() -> Result<PathBuf, String> {
+    Ok(system32("curl.exe"))
+}
+
+#[cfg(not(windows))]
+fn curl() -> Result<PathBuf, String> {
+    system_tool(&["/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl"])
+}
+
 /// Fetch `url` with curl. With `progress`, the expected size and a callback,
 /// the growing file is sampled so the interface can show how far along it is.
 fn download(
@@ -564,7 +620,7 @@ fn download(
     seconds: u64,
     progress: Option<Progress<'_>>,
 ) -> Result<(), String> {
-    let mut child = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
+    let mut child = Command::new(curl()?)
         .args([
             "--fail",
             "--silent",
@@ -631,13 +687,24 @@ fn checksum_for(text: &str, name: &str) -> Option<String> {
     })
 }
 
+/// The signature file holds the 64-byte Ed25519 signature as hex.
+fn verify_signature(key: &[u8; 32], message: &[u8], signature: &[u8]) -> Result<(), String> {
+    use ring::signature::{ED25519, UnparsedPublicKey};
+    let signature = decode_hex(&String::from_utf8_lossy(signature))
+        .filter(|bytes| bytes.len() == 64)
+        .ok_or("The release signature is malformed")?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(message, &signature)
+        .map_err(|_| "The release is not signed by the Modo publisher".to_owned())
+}
+
 fn verify_checksum(path: &Path, expected: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid release checksum".into());
     }
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let len = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if len == 0 {
@@ -645,14 +712,26 @@ fn verify_checksum(path: &Path, expected: &str) -> Result<(), String> {
         }
         hasher.update(&buffer[..len]);
     }
-    if format!("{:x}", hasher.finalize()) != expected.to_ascii_lowercase() {
+    let actual: String = hasher
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual != expected.to_ascii_lowercase() {
         return Err("The update failed SHA-256 verification".into());
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn install(exe: &Path, package: &Path, version: &str, _updates: &Path) -> Result<(), String> {
+fn install(
+    exe: &Path,
+    package: &Path,
+    version: &str,
+    _updates: &Path,
+    _sha256: &str,
+) -> Result<(), String> {
     let app = exe
         .ancestors()
         .find(|path| path.extension().is_some_and(|ext| ext == "app"))
@@ -702,13 +781,19 @@ fn install(exe: &Path, package: &Path, version: &str, _updates: &Path) -> Result
 }
 
 #[cfg(target_os = "linux")]
-fn install(exe: &Path, package: &Path, version: &str, _updates: &Path) -> Result<(), String> {
+fn install(
+    exe: &Path,
+    package: &Path,
+    version: &str,
+    _updates: &Path,
+    _sha256: &str,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if package.extension().is_some_and(|ext| ext == "deb") {
         return Err("A system installation needs package-manager permission".into());
     }
     let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
-    run(Command::new("tar")
+    run(Command::new(system_tool(&["/usr/bin/tar", "/bin/tar"])?)
         .arg("-xzf")
         .arg(package)
         .arg("-C")
@@ -736,7 +821,13 @@ fn install(exe: &Path, package: &Path, version: &str, _updates: &Path) -> Result
 }
 
 #[cfg(target_os = "windows")]
-fn install(exe: &Path, package: &Path, _version: &str, updates: &Path) -> Result<(), String> {
+fn install(
+    exe: &Path,
+    package: &Path,
+    _version: &str,
+    updates: &Path,
+    sha256: &str,
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let dir = exe.parent().ok_or("No installation folder")?;
     let script = package
@@ -745,10 +836,13 @@ fn install(exe: &Path, package: &Path, _version: &str, updates: &Path) -> Result
         .join("install.ps1");
     let relaunch = updates.join("relaunch");
     let _ = fs::remove_file(&relaunch);
-    fs::write(&script, r#"param([int]$ParentId, [string]$Installer, [string]$InstallDir, [string]$Relaunch)
+    // The installer waits on disk until Modo quits, so it is checked again
+    // right before it runs.
+    fs::write(&script, r#"param([int]$ParentId, [string]$Installer, [string]$InstallDir, [string]$Relaunch, [string]$Sha256)
 $ErrorActionPreference = 'Stop'
 Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
 while (Get-Process -Name modo -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $InstallDir 'modo.exe') }) { Start-Sleep -Seconds 1 }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash.ToLower() -ne $Sha256.ToLower()) { throw 'Modo installer changed after it was verified' }
 $process = Start-Process -FilePath $Installer -ArgumentList @('/S', ('/D=' + $InstallDir)) -Wait -PassThru
 if ($process.ExitCode -ne 0) { throw ('Modo installer failed: ' + $process.ExitCode) }
 Remove-Item -LiteralPath $Installer -Force
@@ -758,7 +852,7 @@ if (Test-Path -LiteralPath $Relaunch) {
     Start-Process -FilePath (Join-Path $InstallDir 'modo.exe')
 }
 "#).map_err(|e| e.to_string())?;
-    Command::new("powershell.exe")
+    Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -775,6 +869,8 @@ if (Test-Path -LiteralPath $Relaunch) {
         .arg(dir)
         .arg("-Relaunch")
         .arg(&relaunch)
+        .arg("-Sha256")
+        .arg(sha256)
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -785,7 +881,13 @@ if (Test-Path -LiteralPath $Relaunch) {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn install(_exe: &Path, _package: &Path, _version: &str, _updates: &Path) -> Result<(), String> {
+fn install(
+    _exe: &Path,
+    _package: &Path,
+    _version: &str,
+    _updates: &Path,
+    _sha256: &str,
+) -> Result<(), String> {
     Err("Automatic updates are unavailable on this platform".into())
 }
 
@@ -894,6 +996,54 @@ mod tests {
             state(Phase::Failed("offline".into()))
                 .status()
                 .contains("offline")
+        );
+    }
+
+    #[test]
+    fn only_releases_signed_by_the_publisher_verify() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let random = ring::rand::SystemRandom::new();
+        let document = Ed25519KeyPair::generate_pkcs8(&random).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let key: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
+        let sums = b"abc123  modo-9.9.9-macos-universal.zip\n";
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let signature = format!("{}\n", hex(pair.sign(sums).as_ref()));
+        assert!(verify_signature(&key, sums, signature.as_bytes()).is_ok());
+        assert!(verify_signature(&key, b"tampered", signature.as_bytes()).is_err());
+        assert!(verify_signature(&key, sums, b"not hex").is_err());
+        let other = Ed25519KeyPair::generate_pkcs8(&random).unwrap();
+        let other = Ed25519KeyPair::from_pkcs8(other.as_ref()).unwrap();
+        let forged = hex(other.sign(sums).as_ref());
+        assert!(verify_signature(&key, sums, forged.as_bytes()).is_err());
+        assert_eq!(decode_hex("0aFf"), Some(vec![0x0a, 0xff]));
+        assert_eq!(decode_hex("abc"), None);
+    }
+
+    #[test]
+    fn the_shipped_release_key_is_a_valid_ed25519_key() {
+        assert!(release_key().is_some(), "RELEASE_KEY must be 64 hex digits");
+    }
+
+    /// Made with the commands the release workflow runs (`openssl pkeyutl
+    /// -sign -rawin`), so the two stay compatible. The key was thrown away.
+    #[test]
+    fn signatures_from_the_release_workflow_verify() {
+        let key: [u8; 32] =
+            decode_hex("fbcd1241bd95019bb9c5306212cc32a3d7823372e72d59497c70891a6e7e6913")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let sums = b"deadbeef  modo-1.0.0-macos-universal.zip\n";
+        let signature = b"17ea968f417e745900a46ae6e4b12d3a2657cd3827a5a99d3fb7d369b11a6fad\
+7455a4287022eb4d04f46188e697b511d09806148987cdd9929f18d426eaf200\n";
+        assert!(verify_signature(&key, sums, signature).is_ok());
+        assert_eq!(
+            checksum_for(
+                &String::from_utf8_lossy(sums),
+                "modo-1.0.0-macos-universal.zip"
+            ),
+            Some("deadbeef".into())
         );
     }
 

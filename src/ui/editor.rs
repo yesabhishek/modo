@@ -571,7 +571,7 @@ impl FileTab {
                         .gap(r(8.))
                         .rounded(r(6.))
                         .bg(theme.yellow_light)
-                        .text_size(r(12.5))
+                        .text_size(r(12.))
                         .child(
                             Icon::new(IconName::TriangleAlert)
                                 .size(r(14.))

@@ -96,10 +96,101 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_capped(root, args, MAX_OUTPUT)
+    run_capped(root, &[], args, MAX_OUTPUT)
 }
 
-fn run_capped<I, S>(root: &Path, args: I, cap: u64) -> Result<Output, String>
+/// Settings that keep a repository's own configuration from running
+/// programs. Modo opens folders it did not create, and `.git/config` travels
+/// with archives, shared drives, and agent sandboxes.
+const SAFE_CONFIG: &[&str] = &[
+    "color.ui=false",
+    "core.quotepath=false",
+    // A file system monitor is a program named by the repository.
+    "core.fsmonitor=false",
+    // `git log` would run gpg.program to check signatures.
+    "log.showSignature=false",
+    // A partial clone fetches missing objects through the configured remote.
+    "protocol.allow=never",
+    // A bare repository hidden inside the project is never treated as one.
+    "safe.bareRepository=explicit",
+];
+
+/// Clean, smudge, and process filters that the repository itself defines
+/// (in `.git/config` or a file it includes). Git runs them while it compares
+/// files, so they are switched off. Filters from the user's global config,
+/// such as Git LFS, keep working.
+fn repository_filters(root: &Path) -> Vec<String> {
+    const KEYS: &str = r"^filter\..*\.(clean|smudge|process)$";
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |key: &[u8]| {
+        let key = String::from_utf8_lossy(key);
+        if let Some((name, _)) = key.strip_prefix("filter.").and_then(|k| k.rsplit_once('.'))
+            && !names.iter().any(|n| n == name)
+        {
+            names.push(name.to_owned());
+        }
+    };
+    let key_of = |entry: &[u8]| {
+        entry
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default()
+            .to_vec()
+    };
+    match run(
+        root,
+        [
+            "config",
+            "--show-scope",
+            "--includes",
+            "-z",
+            "--get-regexp",
+            KEYS,
+        ],
+    ) {
+        // Exit status 1 with no message means nothing matched.
+        Ok(out) if out.success || out.error.is_empty() => {
+            let mut fields = out.bytes.split(|b| *b == 0);
+            while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
+                if matches!(scope, b"local" | b"worktree") {
+                    add(&key_of(entry));
+                }
+            }
+        }
+        // Git before 2.26 has no --show-scope; read the repository file alone.
+        _ => {
+            if let Ok(out) = run(
+                root,
+                [
+                    "config",
+                    "--local",
+                    "--includes",
+                    "-z",
+                    "--get-regexp",
+                    KEYS,
+                ],
+            ) {
+                for entry in out.bytes.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+                    add(&key_of(entry));
+                }
+            }
+        }
+    }
+    names
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("filter.{name}.clean="),
+                format!("filter.{name}.smudge="),
+                format!("filter.{name}.process="),
+                format!("filter.{name}.required=false"),
+            ]
+        })
+        .flat_map(|setting| ["-c".to_owned(), setting])
+        .collect()
+}
+
+fn run_capped<I, S>(root: &Path, guard: &[String], args: I, cap: u64) -> Result<Output, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -111,11 +202,12 @@ where
     command
         .arg("--no-optional-locks")
         .arg("--literal-pathspecs")
-        .args(["-c", "color.ui=false", "-c", "core.quotepath=false"])
-        .args(["-c", "core.fsmonitor=false"])
+        .args(SAFE_CONFIG.iter().flat_map(|setting| ["-c", setting]))
+        .args(guard)
         .current_dir(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -199,21 +291,30 @@ pub fn inspect(folder: &Path) -> Result<Option<Repository>, String> {
     }
     let root = path_from_bytes(top.bytes.strip_suffix(b"\n").unwrap_or(&top.bytes));
     let root = dunce::canonicalize(&root).unwrap_or(root);
-    let branch = run(&root, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    let branch = if branch.success {
-        String::from_utf8_lossy(&branch.bytes).trim().to_owned()
-    } else {
-        let head = run(&root, ["rev-parse", "--short", "HEAD"])?;
-        format!("Detached {}", String::from_utf8_lossy(&head.bytes).trim())
-    };
-    let status = run(
+    let guard = repository_filters(&root);
+    // One process for the branch and every change.
+    let status = run_capped(
         &root,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &guard,
+        [
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+            // Never look inside submodules: each has a config of its own.
+            "--ignore-submodules=dirty",
+        ],
+        MAX_OUTPUT,
     )?;
     if !status.success {
         return Err(status.error);
     }
-    let (mut changes, limited) = parse_status(&status.bytes)?;
+    let Status {
+        branch,
+        mut changes,
+        limited,
+    } = parse_status(&status.bytes)?;
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     let trees = run(&root, ["worktree", "list", "--porcelain", "-z"])?;
     if !trees.success {
@@ -229,28 +330,61 @@ pub fn inspect(folder: &Path) -> Result<Option<Repository>, String> {
     }))
 }
 
-fn parse_status(bytes: &[u8]) -> Result<(Vec<Change>, bool), String> {
-    let mut records = bytes.split(|b| *b == 0);
-    let mut changes = Vec::new();
-    for_record(&mut records, &mut changes)?;
-    let limited = changes.len() > MAX_CHANGES;
-    changes.truncate(MAX_CHANGES);
-    Ok((changes, limited))
+struct Status {
+    branch: String,
+    changes: Vec<Change>,
+    limited: bool,
 }
-fn for_record<'a>(
-    records: &mut impl Iterator<Item = &'a [u8]>,
-    changes: &mut Vec<Change>,
-) -> Result<(), String> {
+
+/// `git status --porcelain=v2 --branch -z`: `# branch.*` headers, then one
+/// record per change. Fields before the path are separated by single spaces;
+/// the path itself may contain spaces.
+fn parse_status(bytes: &[u8]) -> Result<Status, String> {
+    let invalid = || "Git returned an invalid status record".to_owned();
+    let mut head = None;
+    let mut oid = None;
+    let mut changes = Vec::new();
+    let mut records = bytes.split(|b| *b == 0);
     while let Some(record) = records.next() {
-        if record.is_empty() {
+        if let Some(header) = record.strip_prefix(b"# ") {
+            let header = String::from_utf8_lossy(header);
+            if let Some(name) = header.strip_prefix("branch.head ") {
+                head = Some(name.to_owned());
+            } else if let Some(id) = header.strip_prefix("branch.oid ") {
+                oid = Some(id.to_owned());
+            }
             continue;
         }
-        if record.len() < 4 || record[2] != b' ' {
-            return Err("Git returned an invalid status record".into());
-        }
-        let index = record[0] as char;
-        let working = record[1] as char;
-        let original = if matches!(index, 'R' | 'C') || matches!(working, 'R' | 'C') {
+        let Some(&kind) = record.first() else {
+            continue;
+        };
+        // Fields before the path: `1 XY sub mH mI mW hH hI`, a rename adds a
+        // score, an unmerged entry has three stages.
+        let (fields, xy) = match kind {
+            b'1' => (8, true),
+            b'2' => (9, true),
+            b'u' => (10, true),
+            b'?' => (1, false),
+            b'!' => continue,
+            _ => return Err(invalid()),
+        };
+        let mut parts = record.splitn(fields + 1, |b| *b == b' ');
+        let (index, working) = if xy {
+            parts.next();
+            let xy = parts
+                .next()
+                .filter(|xy| xy.len() == 2)
+                .ok_or_else(invalid)?;
+            // Porcelain v2 marks "unchanged" with a dot.
+            let state = |c: u8| if c == b'.' { ' ' } else { c as char };
+            (state(xy[0]), state(xy[1]))
+        } else {
+            ('?', '?')
+        };
+        let path = parts
+            .nth(fields - if xy { 2 } else { 0 })
+            .ok_or_else(invalid)?;
+        let original = if kind == b'2' {
             Some(path_from_bytes(
                 records
                     .next()
@@ -260,7 +394,7 @@ fn for_record<'a>(
             None
         };
         changes.push(Change {
-            path: path_from_bytes(&record[3..]),
+            path: path_from_bytes(path),
             original,
             index,
             working,
@@ -269,7 +403,20 @@ fn for_record<'a>(
             break;
         }
     }
-    Ok(())
+    let limited = changes.len() > MAX_CHANGES;
+    changes.truncate(MAX_CHANGES);
+    let branch = match head.as_deref() {
+        Some("(detached)") | None => {
+            let short: String = oid.unwrap_or_default().chars().take(7).collect();
+            format!("Detached {short}")
+        }
+        Some(name) => name.to_owned(),
+    };
+    Ok(Status {
+        branch,
+        changes,
+        limited,
+    })
 }
 fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
     let mut result: Vec<Worktree> = Vec::new();
@@ -411,6 +558,15 @@ fn resolve(root: &Path, rev: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+const NO_SHARED_HISTORY: &str = "share no history";
+const MISSING_BRANCH: &str = "Cannot find branch";
+
+/// The base branch cannot be compared with this one at all, as opposed to
+/// Git failing for some other reason.
+pub fn is_unusable_base(error: &str) -> bool {
+    error.contains(NO_SHARED_HISTORY) || error.starts_with(MISSING_BRANCH)
+}
+
 /// One unified patch for every change in scope, ready for the review surface.
 pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, String> {
     let (base, target) = match &scope {
@@ -427,10 +583,10 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
         ReviewScope::Branch(base) => {
             let head = resolve(root, "HEAD").ok_or("This branch has no commits yet.")?;
             let base_commit =
-                resolve(root, base).ok_or_else(|| format!("Cannot find branch {base}."))?;
+                resolve(root, base).ok_or_else(|| format!("{MISSING_BRANCH} {base}."))?;
             let merge_base = run(root, ["merge-base", &base_commit, &head])?;
             if !merge_base.success {
-                return Err(format!("{base} and this branch share no history."));
+                return Err(format!("{base} and this branch {NO_SHARED_HISTORY}."));
             }
             (
                 String::from_utf8_lossy(&merge_base.bytes).trim().to_owned(),
@@ -442,6 +598,7 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
         "diff",
         "--no-ext-diff",
         "--no-textconv",
+        "--ignore-submodules=dirty",
         "--find-renames",
         "--unified=3",
         &base,
@@ -450,7 +607,7 @@ pub fn review_patch(root: &Path, scope: ReviewScope) -> Result<ReviewPatch, Stri
         args.push(target);
     }
     args.push("--");
-    let tracked = run_capped(root, args, MAX_PATCH)?;
+    let tracked = run_capped(root, &repository_filters(root), args, MAX_PATCH)?;
     if !tracked.success {
         return Err(tracked.error);
     }
@@ -766,6 +923,56 @@ mod tests {
         assert_eq!(files.len(), cases.len());
         assert_eq!(quote_path("a/", "say \"hi\".txt"), r#""a/say \"hi\".txt""#);
     }
+    #[cfg(unix)]
+    #[test]
+    fn programs_named_by_the_repository_never_run() {
+        let dir = repository();
+        let marker = dir.path().join("ran");
+        let command = format!("sh -c 'touch {}; cat'", marker.display());
+        git(dir.path(), &["config", "filter.evil.clean", &command]);
+        git(dir.path(), &["config", "filter.evil.required", "true"]);
+        git(dir.path(), &["config", "log.showSignature", "true"]);
+        git(
+            dir.path(),
+            &[
+                "config",
+                "gpg.program",
+                &format!("touch {}", marker.display()),
+            ],
+        );
+        std::fs::write(dir.path().join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::write(dir.path().join("file.txt"), "edited\n").unwrap();
+        let repo = inspect(dir.path()).unwrap().unwrap();
+        assert!(repo.changes.iter().any(|c| c.path == Path::new("file.txt")));
+        let review = review_patch(&repo.root, ReviewScope::Uncommitted).unwrap();
+        assert!(review.patch.contains("+edited"));
+        recent_commits(&repo.root);
+        assert!(!marker.exists(), "a repository-defined program ran");
+    }
+
+    #[test]
+    fn status_records_parse_branches_renames_and_spaces() {
+        let bytes = b"# branch.oid 0123456789abcdef\0# branch.head (detached)\0\
+1 .M N... 100644 100644 100644 aa bb a file.txt\0\
+2 R. N... 100644 100644 100644 aa bb R100 new name.txt\0old name.txt\0\
+? new dir/x y.txt\0";
+        let status = parse_status(bytes).unwrap();
+        assert_eq!(status.branch, "Detached 0123456");
+        assert_eq!(status.changes.len(), 3);
+        assert_eq!(status.changes[0].path, Path::new("a file.txt"));
+        assert_eq!(
+            (status.changes[0].index, status.changes[0].working),
+            (' ', 'M')
+        );
+        assert_eq!(status.changes[1].badge(), "R");
+        assert_eq!(
+            status.changes[1].original.as_deref(),
+            Some(Path::new("old name.txt"))
+        );
+        assert_eq!(status.changes[2].badge(), "A");
+        assert!(parse_status(b"1 M\0").is_err());
+    }
+
     #[test]
     fn unborn_repositories_review_against_the_empty_tree() {
         let dir = tempfile::tempdir().unwrap();

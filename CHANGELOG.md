@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 (2026-11-15)
+
+- **Opening a folder never runs its code.** Git filters, signature checks, file system monitors, and lazy fetches named in a project's own `.git/config` are switched off when Modo reads status and diffs. Filters from your global config, such as Git LFS, keep working.
+- **Safer markdown.** Links open only web and mail addresses, and files inside the project. Other URL schemes, network shares, and paths that climb out of the project are refused. Images load only from the project; web images never load, so a document cannot report that it was opened.
+- **Signed updates.** Each release's checksum list is signed with the publisher's key, and Modo installs an update only when the signature matches. The automatic check runs at most once a day.
+- **Terminal clipboard.** Programs in the terminal can copy (tmux, Neovim over SSH) but never read the clipboard, and the status bar says when one copies.
+- **Snappier with busy agents.** Build output and Git's object store are filtered out before file events reach the window, a burst of thousands of changes is read once, Git status never runs twice at a time, and auto save no longer runs Git after every pause. Settings are written in the background. Go to file ranks large projects off the UI thread and lists your open tabs first.
+- **Lighter.** Mermaid diagrams are capped in size and memory and skip a PNG round trip. Five duplicate crates are gone.
+- **Review tells the truth.** When the base branch shares no history with yours, the review shows uncommitted changes and says why, the same way on the Review tab, the overview, and the Changes panel. The status bar counts "uncommitted" files.
+- **Quieter sidebar.** One row of tabs (Files, Search, Changes, To-dos) and a settings button replace five stacked rows. The Changes panel no longer repeats the branch and compare menu. Text sizes and corners follow one scale throughout.
+- **Auto save timing.** Settings > Editor offers Off, after 0.25 s, after 1 s, or when leaving the file. Every settings row is one line.
+
 ## 0.5.0 (2026-11-10)
 
 - **Check for updates.** Settings > About has a Check for updates button, also in the app menu and the command palette. It reports whether a newer release is out, downloads it with a progress figure in the status bar, and offers Restart now when it is installed. Source builds are pointed at the release page instead. The automatic check at launch is unchanged and no longer shows a message when the network is down.

@@ -42,7 +42,7 @@ pub fn identity(cx: &App) -> AnyElement {
                                         .flex_none()
                                         .px(r(7.))
                                         .py(r(2.))
-                                        .rounded(r(5.))
+                                        .rounded(r(6.))
                                         .bg(theme.list_hover)
                                         .text_size(r(11.5))
                                         .text_color(theme.muted_foreground)

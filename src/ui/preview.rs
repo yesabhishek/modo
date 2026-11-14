@@ -13,8 +13,8 @@ use gpui_kit::component::{
     text::{FrontmatterPlugin, MarkdownExtensions, MarkdownNode, TextView, TextViewStyle},
 };
 use gpui_kit::{
-    App, FontWeight, Hsla, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, ParentElement,
-    Rgba, SharedString, StyleRefinement, Styled, StyledImage as _, WeakEntity, div, img, px,
+    App, FontWeight, Hsla, ImageSource, IntoElement, ObjectFit, ParentElement, RenderImage, Rgba,
+    SharedString, SharedUri, StyleRefinement, Styled, StyledImage as _, WeakEntity, div, img, px,
 };
 use markdown::mdast::Node;
 use mermaid_rs_renderer as mermaid;
@@ -25,9 +25,12 @@ use super::r;
 /// Diagrams are rasterised at this multiple of their natural size so they
 /// stay sharp on high-density displays.
 const SCALE: f32 = 2.0;
-/// Keep one diagram's bitmap bounded, whatever the source asks for.
+/// Keep one diagram's bitmap bounded, whatever the source asks for: no side
+/// longer than this, and no more than `MAX_PIXELS` in all (32 MB of pixels).
 const MAX_SIDE: f32 = 6000.0;
-const CACHE_LIMIT: usize = 64;
+const MAX_PIXELS: f32 = 8_000_000.0;
+/// Finished diagrams kept in memory, by pixel bytes.
+const CACHE_BYTES: usize = 96 * 1024 * 1024;
 const BLOCK: &str = "mermaid";
 
 pub fn is_markdown(language: &str) -> bool {
@@ -37,28 +40,43 @@ pub fn is_markdown(language: &str) -> bool {
 /// Where a link in a document leads.
 #[derive(Debug, PartialEq)]
 enum LinkTarget {
-    /// Something for the browser or the mail client.
+    /// A web page or an email address, for the browser or the mail client.
     External(String),
-    /// A file in or beside the project, with an optional `#L12` line.
+    /// A file in the project, with an optional `#L12` line.
     File(PathBuf, Option<u32>),
     /// A heading in the same document.
     Anchor,
+    /// Anything else: another URL scheme (`file:`, an app's own scheme), a
+    /// network share, or a path that climbs out of the project. A document
+    /// is untrusted input, so these are neither opened nor loaded.
+    Blocked,
 }
+
+/// URL schemes a document may hand to the operating system.
+const OPEN_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
 
 /// Resolve a link the way a repository browser does: `/docs/a.md` from the
 /// project root, anything else from the folder of the document it is in.
+/// Files resolve only inside the project (or, for a file opened on its own,
+/// inside its folder).
 fn link_target(href: &str, document: &Path, root: Option<&Path>) -> LinkTarget {
     let href = href.trim();
     if href.starts_with('#') || href.is_empty() {
         return LinkTarget::Anchor;
     }
-    // `scheme:` before any slash: http, https, mailto, and the rest.
+    // `scheme:` before any slash. One letter is a Windows drive, not a scheme.
     if let Some((scheme, _)) = href.split_once(':')
-        && !scheme.is_empty()
-        && !scheme.contains(['/', '.', '\\'])
         && scheme.len() > 1
+        && !scheme.contains(['/', '.', '\\'])
     {
-        return LinkTarget::External(href.to_owned());
+        return if OPEN_SCHEMES
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        {
+            LinkTarget::External(href.to_owned())
+        } else {
+            LinkTarget::Blocked
+        };
     }
     let (path, fragment) = match href.split_once('#') {
         Some((path, fragment)) => (path, Some(fragment)),
@@ -69,14 +87,45 @@ fn link_target(href: &str, document: &Path, root: Option<&Path>) -> LinkTarget {
         .and_then(|fragment| fragment.strip_prefix('L'))
         .and_then(|line| line.split('-').next())
         .and_then(|line| line.parse().ok());
-    LinkTarget::File(resolve(&percent_decode(path), document, root), line)
+    match resolve(&percent_decode(path), document, root) {
+        Some(path) => LinkTarget::File(path, line),
+        None => LinkTarget::Blocked,
+    }
 }
 
-fn resolve(relative: &str, document: &Path, root: Option<&Path>) -> PathBuf {
-    match (relative.strip_prefix('/'), root) {
-        (Some(from_root), Some(root)) => root.join(from_root),
-        _ => document.parent().unwrap_or(Path::new(".")).join(relative),
+/// The file a relative link names, or `None` when it leaves the project.
+fn resolve(relative: &str, document: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    // `//host/share` and `\\host\share` reach across the network on Windows.
+    if relative.starts_with("//") || relative.starts_with('\\') || relative.contains('\0') {
+        return None;
     }
+    let folder = document.parent().unwrap_or(Path::new("."));
+    let boundary = root.unwrap_or(folder);
+    let joined = match relative.strip_prefix('/') {
+        Some(from_root) => boundary.join(from_root),
+        None => folder.join(relative),
+    };
+    let path = normalize(&joined);
+    path.starts_with(normalize(boundary)).then_some(path)
+}
+
+/// Remove `.` and `..` without touching the disk, so containment can be
+/// checked before anything is read.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return PathBuf::new();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn percent_decode(text: &str) -> String {
@@ -143,25 +192,31 @@ pub fn body(
                         .code_block(code_block)
                         .table_head(table_head),
                 )
-                // A local picture is read from disk beside the document.
+                // Pictures are read from the project only. Modo has no HTTP
+                // client, so a web address never loads (and never reports
+                // to a tracker that the document was opened).
                 .image_source(move |uri| {
                     match link_target(uri.as_ref(), &image_document, image_root.as_deref()) {
                         LinkTarget::File(path, _) => ImageSource::from(path),
-                        // A web address is fetched as before.
-                        _ => ImageSource::from(uri.clone()),
+                        _ => ImageSource::from(SharedUri::from("about:blank")),
                     }
                 })
-                // Links to project files open in Modo; the rest go to the browser.
+                // Links to project files open in Modo; web and mail links go
+                // to the browser; anything else is refused.
                 .on_link_click(move |href, _, window, cx| {
-                    match link_target(href, &link_document, link_root.as_deref()) {
+                    let target = link_target(href, &link_document, link_root.as_deref());
+                    let _ = workspace.update(cx, |workspace, cx| match target {
                         LinkTarget::External(url) => cx.open_url(&url),
                         LinkTarget::Anchor => {}
                         LinkTarget::File(path, line) => {
-                            let _ = workspace.update(cx, |workspace, cx| {
-                                workspace.open_linked(path, line, window, cx)
-                            });
+                            workspace.open_linked(path, line, window, cx)
                         }
-                    }
+                        LinkTarget::Blocked => workspace.notify_error(
+                            "Modo opens web and mail links, and files inside this project.",
+                            window,
+                            cx,
+                        ),
+                    });
                 })
                 .markdown_extensions(MarkdownExtensions::default().frontmatter())
                 .markdown_block_parser(parse_block)
@@ -219,7 +274,7 @@ fn render_block(
         .border_color(theme.border);
     match diagram(&source, palette, cx) {
         Some(Ok(bitmap)) => frame.flex().justify_center().child(
-            img(ImageSource::Image(bitmap.image))
+            img(ImageSource::Render(bitmap.image))
                 .w(px(bitmap.width))
                 .max_w_full()
                 .object_fit(ObjectFit::Contain),
@@ -228,7 +283,7 @@ fn render_block(
             .bg(theme.muted)
             .child(
                 div()
-                    .text_size(r(12.5))
+                    .text_size(r(12.))
                     .text_color(theme.muted_foreground)
                     .child(format!("Couldn't draw this diagram: {message}")),
             )
@@ -236,7 +291,7 @@ fn render_block(
                 div()
                     .mt(r(8.))
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(r(12.5))
+                    .text_size(r(12.))
                     .child(source),
             ),
         // Still being drawn on a background thread.
@@ -247,7 +302,7 @@ fn render_block(
             .justify_center()
             .child(
                 div()
-                    .text_size(r(12.5))
+                    .text_size(r(12.))
                     .text_color(theme.muted_foreground)
                     .child("Drawing diagram…"),
             ),
@@ -256,9 +311,11 @@ fn render_block(
 
 #[derive(Clone)]
 struct Bitmap {
-    image: Arc<Image>,
+    image: Arc<RenderImage>,
     /// Natural size in logical pixels.
     width: f32,
+    /// Memory the pixels take.
+    bytes: usize,
 }
 
 type Rendered = Result<Bitmap, String>;
@@ -282,10 +339,6 @@ fn diagram(source: &SharedString, palette: Palette, cx: &mut App) -> Option<Rend
         if let Some(found) = cache.get(&key) {
             return found.clone();
         }
-        if cache.len() >= CACHE_LIMIT {
-            // Keep the ones in flight: their tasks will fill them in.
-            cache.retain(|_, slot| slot.is_none());
-        }
         cache.insert(key, None);
     }
     let source = source.clone();
@@ -295,6 +348,16 @@ fn diagram(source: &SharedString, palette: Palette, cx: &mut App) -> Option<Rend
             .spawn(async move { rasterize(&source, &palette) })
             .await;
         if let Ok(mut cache) = cache().lock() {
+            let held: usize = cache
+                .values()
+                .filter_map(|slot| slot.as_ref()?.as_ref().ok())
+                .map(|bitmap| bitmap.bytes)
+                .sum();
+            let adding = rendered.as_ref().map_or(0, |bitmap| bitmap.bytes);
+            if held + adding > CACHE_BYTES {
+                // Drop the finished ones; those in flight fill themselves in.
+                cache.retain(|_, slot| slot.is_none());
+            }
             cache.insert(key, Some(rendered));
         }
         cx.update(|cx| cx.refresh_windows());
@@ -336,21 +399,32 @@ fn rasterize(source: &str, palette: &Palette) -> Rendered {
     if !(width > 0.0 && height > 0.0) {
         return Err("the diagram is empty".into());
     }
-    let scale = SCALE.min(MAX_SIDE / width).min(MAX_SIDE / height);
-    let mut pixmap = tiny_skia::Pixmap::new(
+    let scale = SCALE
+        .min(MAX_SIDE / width)
+        .min(MAX_SIDE / height)
+        .min((MAX_PIXELS / (width * height)).sqrt());
+    let (columns, rows) = (
         (width * scale).ceil().max(1.0) as u32,
         (height * scale).ceil().max(1.0) as u32,
-    )
-    .ok_or("the diagram is too large")?;
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(columns, rows).ok_or("the diagram is too large")?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
-    let png = pixmap.encode_png().map_err(|e| e.to_string())?;
+    // Straight to the BGRA GPUI uploads, without a PNG round trip.
+    let mut pixels = Vec::with_capacity(pixmap.data().len());
+    for pixel in pixmap.pixels() {
+        let color = pixel.demultiply();
+        pixels.extend_from_slice(&[color.blue(), color.green(), color.red(), color.alpha()]);
+    }
+    let bytes = pixels.len();
+    let buffer = image::RgbaImage::from_raw(columns, rows, pixels).ok_or("the diagram is empty")?;
     Ok(Bitmap {
-        image: Arc::new(Image::from_bytes(ImageFormat::Png, png)),
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
         width,
+        bytes,
     })
 }
 
@@ -461,7 +535,11 @@ mod tests {
         let root = Some(Path::new("/project"));
         assert_eq!(
             link_target("./api.md", document, root),
-            LinkTarget::File("/project/docs/./api.md".into(), None)
+            LinkTarget::File("/project/docs/api.md".into(), None)
+        );
+        assert_eq!(
+            link_target("../src/lib.rs", document, root),
+            LinkTarget::File("/project/src/lib.rs".into(), None)
         );
         assert_eq!(
             link_target("/src/main.rs#L42-L50", document, root),
@@ -479,10 +557,47 @@ mod tests {
             );
         }
         // A Windows drive letter is a path, not a URL scheme.
-        assert!(matches!(
+        assert!(!matches!(
             link_target("C:/notes.md", document, None),
-            LinkTarget::File(..)
+            LinkTarget::External(_)
         ));
+    }
+
+    #[test]
+    fn documents_cannot_reach_outside_the_project_or_launch_apps() {
+        let document = Path::new("/project/docs/guide.md");
+        let root = Some(Path::new("/project"));
+        for href in [
+            "file:///Applications/Calculator.app",
+            "FILE:///etc/passwd",
+            "vscode://open?file=/etc/passwd",
+            "javascript:alert(1)",
+            "smb://server/share",
+            "../../etc/passwd",
+            "/../../etc/passwd",
+            "//attacker/share/pixel.png",
+            "\\\\attacker\\share\\pixel.png",
+            "%2e%2e/%2e%2e/etc/passwd",
+        ] {
+            assert_eq!(
+                link_target(href, document, root),
+                LinkTarget::Blocked,
+                "{href}"
+            );
+        }
+        assert_eq!(
+            link_target("HTTPS://example.com", document, root),
+            LinkTarget::External("HTTPS://example.com".into())
+        );
+        // A file opened on its own may link beside itself, not above.
+        assert_eq!(
+            link_target("notes.md", document, None),
+            LinkTarget::File("/project/docs/notes.md".into(), None)
+        );
+        assert_eq!(
+            link_target("../secret.md", document, None),
+            LinkTarget::Blocked
+        );
     }
 
     #[test]
@@ -502,7 +617,11 @@ mod tests {
         let bitmap = rasterize("flowchart LR; A[Start] --> B{Ok?}; B --> C[Done]", &palette)
             .expect("renders");
         assert!(bitmap.width > 50.0);
-        assert!(!bitmap.image.bytes.is_empty());
+        assert!(bitmap.bytes > 0);
+        assert_eq!(
+            bitmap.image.as_bytes(0).map(<[u8]>::len),
+            Some(bitmap.bytes)
+        );
     }
 
     #[test]

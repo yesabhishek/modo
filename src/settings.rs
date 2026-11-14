@@ -1,6 +1,9 @@
 //! User preferences and the remembered session, stored as JSON in the
 //! platform configuration directory and written off the UI thread.
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,30 @@ pub enum ReviewBase {
     Branch,
 }
 
+/// When auto save writes an edited file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AutoSaveDelay {
+    /// A quarter of a second after typing stops.
+    #[default]
+    Quick,
+    /// A second after typing stops: fewer half-typed files for dev servers
+    /// and agents to react to.
+    Relaxed,
+    /// Only when switching tabs, leaving the window, or quitting.
+    OnLeave,
+}
+
+impl AutoSaveDelay {
+    /// The pause after typing, or `None` when saving waits for leaving.
+    pub fn delay(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Quick => Some(std::time::Duration::from_millis(250)),
+            Self::Relaxed => Some(std::time::Duration::from_secs(1)),
+            Self::OnLeave => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -74,6 +101,7 @@ pub struct Settings {
     pub tab_size: u8,
     pub format_on_save_trim: bool,
     pub auto_save: bool,
+    pub auto_save_delay: AutoSaveDelay,
     pub terminal_font_size: f32,
     /// The profile new terminals start with. Empty means the platform default.
     pub terminal_profile: String,
@@ -102,6 +130,7 @@ impl Default for Settings {
             tab_size: 4,
             format_on_save_trim: false,
             auto_save: true,
+            auto_save_delay: AutoSaveDelay::Quick,
             terminal_font_size: 12.5,
             terminal_profile: String::new(),
             terminal_shell: String::new(),
@@ -181,10 +210,30 @@ impl Global for Session {}
 impl Session {
     const MAX_RECENT: usize = 12;
 
+    /// Recent folders are not checked here: a folder on a sleeping network
+    /// drive would hold up launch. `prune_missing` checks them in the background.
     pub fn load() -> Self {
-        let mut session: Self = load_json("session.json").unwrap_or_default();
-        session.recent.retain(|path| path.is_dir());
-        session
+        load_json("session.json").unwrap_or_default()
+    }
+
+    /// Forget recent folders that no longer exist, off the UI thread.
+    pub fn prune_missing(cx: &mut App) {
+        let recent = cx.global::<Self>().recent.clone();
+        cx.spawn(async move |cx| {
+            let missing: Vec<PathBuf> = cx
+                .background_executor()
+                .spawn(async move { recent.into_iter().filter(|p| !p.is_dir()).collect() })
+                .await;
+            if missing.is_empty() {
+                return;
+            }
+            cx.update(|cx| {
+                let mut session = cx.global::<Self>().clone();
+                session.recent.retain(|path| !missing.contains(path));
+                cx.set_global(session);
+            });
+        })
+        .detach();
     }
 
     pub fn project(&self, root: &Path) -> Option<&ProjectSession> {
@@ -222,23 +271,55 @@ fn load_json<T: for<'de> Deserialize<'de>>(name: &str) -> Option<T> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Files are a few kilobytes, so they are written in place: replace through a
-/// temporary file so a crash mid-write never leaves truncated JSON behind.
+/// The newest unwritten contents of each file.
+static PENDING: Mutex<Vec<(&'static str, Vec<u8>)>> = Mutex::new(Vec::new());
+/// Held while writing, so an older version can never land after a newer one.
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// Serialize now, write on a background thread: the disk (a slow network
+/// home folder, a busy laptop) never holds up the window. Each file is
+/// replaced through a temporary file so a crash never leaves truncated JSON.
 fn store_json<T: Serialize>(name: &'static str, value: &T) {
     if std::env::var_os("MODO_TEMPORARY_SESSION").is_some() {
         return;
     }
-    let Some(dir) = config_dir() else { return };
     let Ok(bytes) = serde_json::to_vec_pretty(value) else {
         return;
     };
+    let Ok(mut pending) = PENDING.lock() else {
+        return;
+    };
+    let idle = pending.is_empty();
+    pending.retain(|(pending_name, _)| *pending_name != name);
+    pending.push((name, bytes));
+    drop(pending);
+    if idle {
+        std::thread::spawn(flush);
+    }
+}
+
+/// Write whatever is still pending. Runs on the writer thread, and on quit.
+pub fn flush() {
+    let Ok(_writing) = WRITING.lock() else {
+        return;
+    };
+    let batch = PENDING
+        .lock()
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default();
+    if batch.is_empty() {
+        return;
+    }
+    let Some(dir) = config_dir() else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    if let Ok(mut file) = tempfile::NamedTempFile::new_in(&dir) {
-        use std::io::Write;
-        if file.write_all(&bytes).is_ok() {
-            let _ = file.persist(dir.join(name));
+    for (name, bytes) in batch {
+        if let Ok(mut file) = tempfile::NamedTempFile::new_in(&dir) {
+            use std::io::Write;
+            if file.write_all(&bytes).is_ok() {
+                let _ = file.persist(dir.join(name));
+            }
         }
     }
 }
