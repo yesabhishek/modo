@@ -47,7 +47,7 @@ gpui-kit = { version = "=0.8.1", features = [
     "tree-sitter-yaml",
     "tree-sitter-zig",
 ] }
-alacritty_terminal = "0.25.1"
+alacritty_terminal = "0.26.0"
 anyhow = "1"
 blake3 = "1.8"
 directories = "6.0"

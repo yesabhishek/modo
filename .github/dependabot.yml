@@ -11,7 +11,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # GPUI Kit is pinned exactly; upgrade it by hand after a visual review.
+    # One pull request a week for routine updates instead of one per crate.
+    groups:
+      rust:
+        update-types: [minor, patch]
     ignore:
+      # Pinned exactly; upgrade by hand after a visual review.
       - dependency-name: gpui-kit
+      # Must match the version GPUI uses, or the app ships two copies of
+      # resvg, usvg, fontdb, and tiny-skia. Moves with gpui-kit.
+      - dependency-name: resvg
+      - dependency-name: image
     open-pull-requests-limit: 5
